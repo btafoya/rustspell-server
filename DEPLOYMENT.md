@@ -8,6 +8,8 @@
 
 ## Environment Variables
 
+See `.env.example` for a copy-pasteable template of every variable below.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUSTSPELL_PORT` | `3000` | Public API port |
@@ -19,6 +21,7 @@
 | `RUSTSPELL_REFRESH_INTERVAL_HOURS` | `24` | Re-download if cache is older than this |
 | `RUSTSPELL_DB_PATH` | OS data directory | SQLite file for the key/tenant store, used when `RUSTSPELL_DB_URL` is unset |
 | `RUSTSPELL_DB_URL` | — | PostgreSQL connection string (`postgres://...`); takes precedence over `RUSTSPELL_DB_PATH` when set |
+| `RUSTSPELL_BOOTSTRAP_SECRETS_PATH` | — | Path to write `{"platform_key":"..."}` when a bootstrap platform key is created |
 | `RUSTSPELL_AUTH_RATE_LIMIT_MAX` | `10` | Auth failures allowed per IP per window before a cooldown |
 | `RUSTSPELL_AUTH_RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window (seconds) for counting auth failures |
 | `RUSTSPELL_AUTH_RATE_LIMIT_COOLDOWN_SECONDS` | `60` | Cooldown (seconds) once the failure threshold is exceeded |

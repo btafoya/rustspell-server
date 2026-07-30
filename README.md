@@ -108,6 +108,8 @@ All authenticated endpoints take the key via the `X-API-Key` header. Open a brow
 
 Environment variables:
 
+See `.env.example` for a copy-pasteable template of every variable below.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUSTSPELL_PORT` | `3000` | Public API port |
