@@ -26,7 +26,7 @@ thiserror = "1"
 spellbook = "0.4.2"
 
 # Dictionary download / cache
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 directories = "5"
 tempfile = "3"
 

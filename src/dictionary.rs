@@ -106,6 +106,10 @@ impl DictionaryManager {
         true
     }
 
+    /// Retry transient network errors with exponential backoff.
+    const RETRY_ATTEMPTS: u32 = 5;
+    const RETRY_BASE_MS: u64 = 250;
+
     async fn download(&self, url: &str) -> Result<Vec<u8>, DictionaryError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -116,31 +120,44 @@ impl DictionaryManager {
                 source: e,
             })?;
 
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| DictionaryError::Download {
-                url: url.to_string(),
-                source: e,
-            })?;
+        let mut last_error = None;
+        for attempt in 0..Self::RETRY_ATTEMPTS {
+            match Self::download_once(&client, url).await {
+                Ok(data) => return Ok(data),
+                Err(err) => {
+                    if !Self::is_transient_error(&err) || attempt == Self::RETRY_ATTEMPTS - 1 {
+                        return Err(DictionaryError::Download {
+                            url: url.to_string(),
+                            source: err,
+                        });
+                    }
+                    last_error = Some(err);
+                    let delay = Duration::from_millis(Self::RETRY_BASE_MS * 2_u64.pow(attempt));
+                    tracing::warn!(
+                        "dictionary download transient failure (attempt {}), retrying in {:?}: {}",
+                        attempt + 1,
+                        delay,
+                        last_error.as_ref().unwrap()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
 
-        let response = response
-            .error_for_status()
-            .map_err(|e| DictionaryError::Download {
-                url: url.to_string(),
-                source: e,
-            })?;
+        Err(DictionaryError::Download {
+            url: url.to_string(),
+            source: last_error.expect("retry loop must set last_error on transient path"),
+        })
+    }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| DictionaryError::Download {
-                url: url.to_string(),
-                source: e,
-            })?;
-
+    async fn download_once(client: &reqwest::Client, url: &str) -> reqwest::Result<Vec<u8>> {
+        let response = client.get(url).send().await?.error_for_status()?;
+        let bytes = response.bytes().await?;
         Ok(bytes.to_vec())
+    }
+
+    fn is_transient_error(err: &reqwest::Error) -> bool {
+        err.is_connect() || err.is_timeout()
     }
 
     async fn atomic_write(&self, dest: &Path, data: Vec<u8>) -> Result<(), DictionaryError> {
@@ -197,5 +214,39 @@ mod tests {
         let aff = dir.path().join("en_US.aff");
         let dic = dir.path().join("en_US.dic");
         assert!(!manager.is_fresh(&aff, &dic).await);
+    }
+
+    #[test]
+    fn detects_connect_errors_as_transient() {
+        let client = reqwest::blocking::Client::new();
+        let connect_err = client.get("http://localhost:1").send().unwrap_err();
+        assert!(DictionaryManager::is_transient_error(&connect_err));
+    }
+
+    #[tokio::test]
+    async fn detects_timeout_errors_as_transient() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(1))
+            .build()
+            .unwrap();
+        let timeout_err = client
+            .get("https://httpbin.org/delay/5")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(DictionaryManager::is_transient_error(&timeout_err));
+    }
+
+    #[tokio::test]
+    async fn status_errors_are_not_transient() {
+        // Build a reqwest error that wraps a status code (404) so is_status is true
+        // but is_connect/is_timeout are false.
+        let status_err = reqwest::get("https://httpbin.org/status/404")
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        assert!(status_err.is_status());
+        assert!(!DictionaryManager::is_transient_error(&status_err));
     }
 }
