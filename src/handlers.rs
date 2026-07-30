@@ -199,15 +199,23 @@ pub async fn metrics_middleware(request: axum::extract::Request, next: Next) -> 
     response
 }
 
-/// Build the public API router.
+/// Build the public API router, including the Swagger UI portal at `/ui`.
 pub fn build_app(state: Arc<AppState>) -> Router {
     let cors = middleware::cors_layer(&state.config);
+    // The portal router is stateless; convert it to the same missing-state type
+    // as the API router so they can be merged.
+    let portal: Router<Arc<AppState>> = crate::swagger::portal_router().with_state(());
 
     Router::new()
+        .route(
+            "/",
+            get(|| async { axum::response::Redirect::permanent("/ui") }),
+        )
         .route("/health", get(health_check))
         .route("/docs", get(openapi_docs))
         .route("/spellcheck", post(spellcheck))
         .route("/spellcheck/positions", post(spellcheck_positions))
+        .merge(portal)
         .layer(
             ServiceBuilder::new()
                 .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

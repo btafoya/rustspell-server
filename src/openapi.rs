@@ -8,9 +8,12 @@ pub fn spec() -> &'static str {
     OPENAPI_SPEC
 }
 
-/// Validate that the embedded spec is valid JSON.
+/// Parse the embedded spec into a typed OpenAPI 3.0 structure.
+///
+/// Available only in test builds to keep the public binary from depending on
+/// `openapiv3`.
 #[cfg(test)]
-pub fn validate() -> Result<serde_json::Value, serde_json::Error> {
+pub fn parse() -> Result<openapiv3::OpenAPI, serde_json::Error> {
     serde_json::from_str(OPENAPI_SPEC)
 }
 
@@ -19,7 +22,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spec_is_valid_json() {
-        validate().expect("openapi.json should be valid JSON");
+    fn spec_is_valid_openapi() {
+        parse().expect("openapi.json should be a valid OpenAPI 3.0.3 document");
     }
 }

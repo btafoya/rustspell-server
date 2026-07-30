@@ -3,7 +3,6 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     http::{HeaderValue, Request, StatusCode},
-    routing::{get, post},
     Router,
 };
 use http_body_util::BodyExt;
@@ -11,7 +10,6 @@ use rustspell_server::{
     config::Config,
     engine::Engine,
     handlers::{self, AppState},
-    middleware,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -35,24 +33,58 @@ world
         refresh_interval_hours: 24,
         cors_origins: vec![HeaderValue::from_static("http://localhost:3000")],
     });
-    let state = Arc::new(AppState::new(engine, config.clone()));
-    let cors = middleware::cors_layer(&config);
-
-    Router::new()
-        .route("/health", get(handlers::health_check))
-        .route("/docs", get(handlers::openapi_docs))
-        .route("/spellcheck", post(handlers::spellcheck))
-        .route(
-            "/spellcheck/positions",
-            post(handlers::spellcheck_positions),
-        )
-        .layer(cors)
-        .with_state(state)
+    let state = Arc::new(AppState::new(engine, config));
+    handlers::build_app(state)
 }
 
 async fn body_json(res: axum::response::Response) -> serde_json::Value {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).expect("response body should be valid JSON")
+}
+
+#[tokio::test]
+async fn root_redirects_to_swagger_ui() {
+    let app = test_app();
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        response.headers().get("location").unwrap(),
+        "/ui",
+        "root should redirect to the Swagger UI portal"
+    );
+}
+
+#[tokio::test]
+async fn ui_returns_swagger_ui_html() {
+    let app = test_app();
+    let response = app
+        .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(content_type.starts_with("text/html"));
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        body.contains("/docs"),
+        "Swagger UI page should load the OpenAPI spec from /docs"
+    );
+    assert!(
+        !body.contains("\"//"),
+        "asset URLs must not be protocol-relative"
+    );
 }
 
 #[tokio::test]
@@ -203,6 +235,54 @@ async fn spellcheck_positions_returns_misspelled_positions() {
     assert_eq!(results[0]["token"], "wrld");
     let positions = results[0]["positions"].as_array().unwrap();
     assert_eq!(positions.len(), 2);
+}
+
+#[tokio::test]
+async fn openapi_spec_covers_all_public_paths() {
+    let spec = rustspell_server::openapi::OPENAPI_SPEC;
+    let doc: serde_json::Value = serde_json::from_str(spec).unwrap();
+    let paths = doc["paths"].as_object().unwrap();
+
+    for route in ["/health", "/docs", "/spellcheck", "/spellcheck/positions"] {
+        assert!(
+            paths.contains_key(route),
+            "openapi.json is missing path {route}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openapi_operations_declare_runtime_status_codes() {
+    let spec = rustspell_server::openapi::OPENAPI_SPEC;
+    let doc: serde_json::Value = serde_json::from_str(spec).unwrap();
+
+    let operations: Vec<(&str, &str, &str, &[&str])> = vec![
+        ("/health", "get", "healthCheck", &["200", "500"]),
+        ("/docs", "get", "getOpenApiSpec", &["200", "500"]),
+        ("/spellcheck", "post", "spellcheck", &["200", "400", "500"]),
+        (
+            "/spellcheck/positions",
+            "post",
+            "spellcheckPositions",
+            &["200", "400", "500"],
+        ),
+    ];
+
+    for (path, method, expected_operation_id, expected_statuses) in operations {
+        let op = &doc["paths"][path][method];
+        assert_eq!(
+            op["operationId"].as_str().unwrap(),
+            expected_operation_id,
+            "operationId mismatch for {method} {path}"
+        );
+        let responses = op["responses"].as_object().unwrap();
+        for status in expected_statuses {
+            assert!(
+                responses.contains_key(*status),
+                "{method} {path} is missing response {status}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

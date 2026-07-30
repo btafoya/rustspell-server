@@ -43,18 +43,15 @@ impl AppError {
         }
     }
 
-    fn problem_type(&self) -> &'static str {
-        match self {
-            AppError::Validation(_) => "https://rustspell.example/errors/validation-error",
-            AppError::JsonRejection(_) => "https://rustspell.example/errors/invalid-json",
-            AppError::DictionaryDownload(_) => {
-                "https://rustspell.example/errors/dictionary-download-error"
-            }
-            AppError::DictionaryParse(_) => {
-                "https://rustspell.example/errors/dictionary-parse-error"
-            }
-            AppError::Internal(_) => "https://rustspell.example/errors/internal-error",
-        }
+    fn problem_type(&self) -> String {
+        let slug = match self {
+            AppError::Validation(_) => "validation-error",
+            AppError::JsonRejection(_) => "invalid-json",
+            AppError::DictionaryDownload(_) => "dictionary-download-error",
+            AppError::DictionaryParse(_) => "dictionary-parse-error",
+            AppError::Internal(_) => "internal-error",
+        };
+        format!("https://github.com/btafoya/rustspell-server/blob/main/docs/errors/{slug}.md")
     }
 
     fn title(&self) -> &'static str {
@@ -72,7 +69,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = ProblemDetails {
-            r#type: self.problem_type().to_string(),
+            r#type: self.problem_type(),
             title: self.title().to_string(),
             status: status.as_u16(),
             detail: self.to_string(),
@@ -100,5 +97,13 @@ mod tests {
         let err: AppError = validator::ValidationErrors::new().into();
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn problem_type_uses_documentation_uri() {
+        let err: AppError = validator::ValidationErrors::new().into();
+        assert!(err
+            .problem_type()
+            .starts_with("https://github.com/btafoya/rustspell-server/blob/main/docs/errors/"));
     }
 }

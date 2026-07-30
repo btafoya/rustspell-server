@@ -13,7 +13,7 @@ A production-ready Rust HTTP server exposing a Hunspell-compatible spell-checkin
 - **Type-Safe**: Strongly-typed request/response models with validation
 - **Observability**: Structured logging, Prometheus metrics, distributed tracing
 - **Production-Ready**: Graceful shutdown, signal handling, CORS allow-list
-- **OpenAPI Compliant**: API documentation served at `/docs`
+- **OpenAPI Compliant**: Interactive Swagger UI at `/ui` and raw spec at `/docs`
 
 ## Quick Start
 
@@ -31,13 +31,16 @@ RUSTSPELL_CORS_ORIGINS=http://localhost:3000 ./target/release/rustspell-server
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/` | Redirects to `/ui` |
+| GET | `/ui` | Interactive Swagger UI documentation portal |
 | GET | `/health` | Liveness/health check |
 | GET | `/health?verbose=true` | Health check with uptime and request count |
-| GET | `/docs` | OpenAPI 3.0 specification |
+| GET | `/docs` | OpenAPI 3.0 specification (JSON) |
 | POST | `/spellcheck` | Spell-check text and/or word list |
 | POST | `/spellcheck/positions` | Misspelled tokens with char positions |
 
-See the full API specification at `/docs` after starting the server.
+Open a browser to `/` after starting the server for interactive documentation, or
+fetch the raw spec from `/docs`.
 
 ## Configuration
 

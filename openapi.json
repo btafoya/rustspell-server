@@ -3,7 +3,16 @@
   "info": {
     "title": "Rust Spell Server",
     "version": "0.1.0",
-    "description": "Hunspell-compatible spell-checking REST API"
+    "description": "Hunspell-compatible spell-checking REST API",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "contact": {
+      "name": "Brian Tafoya",
+      "email": "btafoya@briantafoya.com",
+      "url": "https://github.com/btafoya/rustspell-server"
+    }
   },
   "servers": [
     {
@@ -11,15 +20,19 @@
       "description": "Local development server"
     }
   ],
+  "security": [],
   "paths": {
     "/health": {
       "get": {
+        "operationId": "healthCheck",
+        "tags": ["Health"],
         "summary": "Health check",
         "description": "Returns service liveness status. Use `?verbose=true` for runtime metrics.",
         "parameters": [
           {
             "name": "verbose",
             "in": "query",
+            "required": false,
             "schema": { "type": "boolean" }
           }
         ],
@@ -31,12 +44,22 @@
                 "schema": { "$ref": "#/components/schemas/HealthResponse" }
               }
             }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
           }
         }
       }
     },
     "/docs": {
       "get": {
+        "operationId": "getOpenApiSpec",
+        "tags": ["Documentation"],
         "summary": "OpenAPI specification",
         "description": "Returns the OpenAPI 3.0 JSON document describing this API.",
         "responses": {
@@ -44,7 +67,18 @@
             "description": "OpenAPI JSON document",
             "content": {
               "application/json": {
-                "schema": { "type": "object" }
+                "schema": {
+                  "description": "OpenAPI 3.0.3 root object",
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
               }
             }
           }
@@ -53,6 +87,8 @@
     },
     "/spellcheck": {
       "post": {
+        "operationId": "spellcheck",
+        "tags": ["Spell-check"],
         "summary": "Spell-check tokens",
         "description": "Accepts text and/or an explicit word list and returns one result per token occurrence.",
         "requestBody": {
@@ -79,12 +115,22 @@
                 "schema": { "$ref": "#/components/schemas/ProblemDetails" }
               }
             }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
           }
         }
       }
     },
     "/spellcheck/positions": {
       "post": {
+        "operationId": "spellcheckPositions",
+        "tags": ["Spell-check"],
         "summary": "Spell-check with token positions",
         "description": "Returns unique misspelled tokens and their char positions in the provided text.",
         "requestBody": {
@@ -111,6 +157,14 @@
                 "schema": { "$ref": "#/components/schemas/ProblemDetails" }
               }
             }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
           }
         }
       }
@@ -129,6 +183,8 @@
       },
       "SpellCheckRequest": {
         "type": "object",
+        "description": "Request body for spell-check endpoints. At least one of `text` or `words` must be provided.",
+        "minProperties": 1,
         "properties": {
           "text": {
             "type": "string",
@@ -161,7 +217,8 @@
           "valid": { "type": "boolean" },
           "suggestions": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": { "type": "string" },
+            "description": "Suggested corrections. Empty when `valid` is `true`."
           }
         }
       },
@@ -182,7 +239,8 @@
           "token": { "type": "string" },
           "positions": {
             "type": "array",
-            "items": { "type": "integer" }
+            "items": { "type": "integer" },
+            "description": "Zero-based character positions of the misspelled token in the provided `text`. Empty when the token was supplied only via `words`."
           },
           "suggestions": {
             "type": "array",

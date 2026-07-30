@@ -43,6 +43,7 @@ The server is a single Tokio binary with two TCP listeners: the public API on `R
 | `src/middleware.rs` | CORS layer configured from allow-list; optional future middleware. |
 | `src/metrics.rs` | Prometheus recorder and mini HTTP server on the metrics port. |
 | `src/openapi.rs` | Static OpenAPI 3.0 JSON document and validation helper. |
+| `src/swagger.rs` | Swagger UI portal served at `/ui` using `swagger-ui-dist`; `/` redirects there. |
 | `benches/spellcheck_bench.rs` | Criterion benchmarks for `/spellcheck` throughput. |
 
 ### 2.1 Dependency changes
@@ -188,6 +189,7 @@ Only misspelled tokens are returned (or all tokens — decide in implementation;
 
 | Handler | Route | Behavior |
 |---------|-------|----------|
+| `swagger_portal` | `GET /ui` | Serve Swagger UI that loads the spec from `GET /docs`; `GET /` redirects to `/ui`. |
 | `health_check` | `GET /health` | Return `{ "status": "ok" }`. |
 | `health_verbose` | `GET /health?verbose=true` | Return status plus runtime uptime and request count. |
 | `openapi_docs` | `GET /docs` | Return embedded `openapi.json` with `application/json`. |
