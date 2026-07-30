@@ -109,6 +109,43 @@ docker run -p 3000:3000 -p 9090:9090 \
 RUSTSPELL_CORS_ORIGINS=http://localhost:3000 docker-compose up
 ```
 
+### Reverse Proxy
+
+Put a reverse proxy in front of the public API port (`3000`) for TLS
+termination. Keep the metrics port (`9090`) off the public internet — scrape
+it from inside your network instead. Set `RUSTSPELL_CORS_ORIGINS` to the
+public proxy origin, not `localhost`.
+
+**Caddy** (`Caddyfile`):
+
+```
+spellcheck.example.com {
+    reverse_proxy localhost:3000
+}
+```
+
+**Nginx**:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name spellcheck.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/spellcheck.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/spellcheck.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+See [Deployment](DEPLOYMENT.md#reverse-proxy) for details.
+
 ## Documentation
 
 - [Product Requirements](REQUIREMENTS.md) — roles, scale, navigation

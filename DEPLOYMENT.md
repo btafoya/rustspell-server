@@ -50,6 +50,56 @@ RUSTSPELL_CORS_ORIGINS=http://localhost:3000 docker-compose up
 
 The compose file mounts a named volume at `/data/dictionaries` so dictionary downloads persist across restarts.
 
+## Reverse Proxy
+
+Terminate TLS and forward to the public API port (`3000`) from a reverse
+proxy; don't expose the metrics port (`9090`) publicly — scrape it from
+inside your network, or proxy it separately behind auth if external access is
+required. Update `RUSTSPELL_CORS_ORIGINS` to the proxy's public origin once
+one is in front of the server.
+
+### Caddy
+
+```
+spellcheck.example.com {
+    reverse_proxy localhost:3000
+}
+```
+
+Caddy handles TLS certificate acquisition and renewal automatically.
+
+### Nginx
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name spellcheck.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/spellcheck.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/spellcheck.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# Optional: internal-only access to metrics
+server {
+    listen 9090;
+    server_name spellcheck.example.com;
+    allow 10.0.0.0/8;
+    deny all;
+
+    location /metrics {
+        proxy_pass http://localhost:9090;
+    }
+}
+```
+
 ## Health Checks
 
 - `GET http://localhost:3000/health` returns `{"status":"ok"}`.
