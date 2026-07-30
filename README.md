@@ -1,11 +1,18 @@
 # Rust Spell Server
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/btafoya/rustspell-server/ci.yml?branch=main)](https://github.com/btafoya/rustspell-server/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org)
 [![spellbook](https://img.shields.io/badge/spellbook-0.4.2-blue)](https://crates.io/crates/spellbook)
 
 A production-ready Rust HTTP server exposing a Hunspell-compatible spell-checking API over OpenAPI-compliant endpoints.
+
+## Motivation
+
+I build several applications that each need spell-checking, and I was tired of
+bolting on a different ad-hoc solution for every one of them. Rust Spell
+Server exists to be that shared piece: a single, fast, self-hosted spell-check
+API any of my apps can call over HTTP instead of vendoring a spell-check
+library per project.
 
 ## Features
 
