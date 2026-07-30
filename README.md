@@ -1,5 +1,10 @@
 # Rust Spell Server
 
+[![Build Status](https://img.shields.io/github/actions/workflow/status/btafoya/rustspell-server/ci.yml?branch=main)](https://github.com/btafoya/rustspell-server/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org)
+[![spellbook](https://img.shields.io/badge/spellbook-0.4.2-blue)](https://crates.io/crates/spellbook)
+
 A production-ready Rust HTTP server exposing a Hunspell-compatible spell-checking API over OpenAPI-compliant endpoints.
 
 ## Features
@@ -14,7 +19,7 @@ A production-ready Rust HTTP server exposing a Hunspell-compatible spell-checkin
 
 ```bash
 # Clone and build
-git clone https://github.com/your-org/rustspell-server.git
+git clone https://github.com/btafoya/rustspell-server.git
 cd rustspell-server
 cargo build --release
 
@@ -69,6 +74,30 @@ docker run -p 3000:3000 -p 9090:9090 \
 RUSTSPELL_CORS_ORIGINS=http://localhost:3000 docker-compose up
 ```
 
+## Documentation
+
+- [Vision](docs/01_VISION.md) — why this project exists
+- [Product Requirements](docs/02_PRODUCT_REQUIREMENTS.md) — roles, scale, navigation
+- [Technical Overview](docs/27_TECHNICAL_OVERVIEW.md) — architecture, build
+  instructions, and developer docs
+- [Deployment](docs/19_DEPLOYMENT.md) — how to run your own instance
+- [Security](docs/21_SECURITY.md) — security model and practices
+- [Contribution Guide](docs/25_CONTRIBUTING.md) — how to contribute
+
+## Contributing
+
+Contributions are welcome. Please read the
+[Contribution Guide](docs/25_CONTRIBUTING.md) and
+[Coding Standards](docs/22_CODING_STANDARDS.md) before opening issues or pull
+requests.
+
+## Security
+
+Rust Spell Server uses CORS allow-list validation, RFC 7807 structured error
+responses, structured logging with request-id propagation, rate-limit friendly
+Prometheus metrics, and dependency auditing. See [Security](docs/21_SECURITY.md)
+for details.
+
 ## Performance Targets
 
 - p50 < 5 ms for `/spellcheck`
@@ -78,4 +107,4 @@ RUSTSPELL_CORS_ORIGINS=http://localhost:3000 docker-compose up
 
 ## License
 
-MIT License - see LICENSE file for details.
+This project is licensed under the [MIT License](LICENSE).
