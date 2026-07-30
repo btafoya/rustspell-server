@@ -1,0 +1,14 @@
+services:
+  rustspell:
+    build: .
+    ports:
+      - "3000:3000"
+      - "9090:9090"
+    environment:
+      RUSTSPELL_LANGUAGE: en_US
+      RUSTSPELL_CORS_ORIGINS: http://localhost:3000
+    volumes:
+      - dict-cache:/data/dictionaries
+
+volumes:
+  dict-cache:

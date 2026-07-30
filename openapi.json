@@ -1,0 +1,205 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Rust Spell Server",
+    "version": "0.1.0",
+    "description": "Hunspell-compatible spell-checking REST API"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local development server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "description": "Returns service liveness status. Use `?verbose=true` for runtime metrics.",
+        "parameters": [
+          {
+            "name": "verbose",
+            "in": "query",
+            "schema": { "type": "boolean" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "summary": "OpenAPI specification",
+        "description": "Returns the OpenAPI 3.0 JSON document describing this API.",
+        "responses": {
+          "200": {
+            "description": "OpenAPI JSON document",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/spellcheck": {
+      "post": {
+        "summary": "Spell-check tokens",
+        "description": "Accepts text and/or an explicit word list and returns one result per token occurrence.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SpellCheckRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Spell-check results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SpellCheckResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/spellcheck/positions": {
+      "post": {
+        "summary": "Spell-check with token positions",
+        "description": "Returns unique misspelled tokens and their char positions in the provided text.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SpellCheckRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Spell-check positions",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PositionsResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "example": "ok" },
+          "uptime_seconds": { "type": "integer" },
+          "request_count": { "type": "integer" }
+        }
+      },
+      "SpellCheckRequest": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 10000,
+            "description": "Free-form text to tokenize and spell-check"
+          },
+          "words": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": { "type": "string" },
+            "description": "Explicit list of words to spell-check"
+          }
+        }
+      },
+      "SpellCheckResponse": {
+        "type": "object",
+        "required": ["results"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TokenResult" }
+          }
+        }
+      },
+      "TokenResult": {
+        "type": "object",
+        "required": ["token", "valid", "suggestions"],
+        "properties": {
+          "token": { "type": "string" },
+          "valid": { "type": "boolean" },
+          "suggestions": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "PositionsResponse": {
+        "type": "object",
+        "required": ["results"],
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/PositionResult" }
+          }
+        }
+      },
+      "PositionResult": {
+        "type": "object",
+        "required": ["token", "positions", "suggestions"],
+        "properties": {
+          "token": { "type": "string" },
+          "positions": {
+            "type": "array",
+            "items": { "type": "integer" }
+          },
+          "suggestions": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "ProblemDetails": {
+        "type": "object",
+        "required": ["type", "title", "status", "detail"],
+        "properties": {
+          "type": { "type": "string", "format": "uri" },
+          "title": { "type": "string" },
+          "status": { "type": "integer" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

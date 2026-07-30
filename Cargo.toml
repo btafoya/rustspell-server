@@ -1,0 +1,54 @@
+[package]
+name = "rustspell-server"
+version = "0.1.0"
+edition = "2021"
+description = "Production-ready Rust HTTP server exposing a Hunspell-compatible spell-checking API"
+license = "MIT"
+
+[dependencies]
+# HTTP Server
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors", "request-id"] }
+
+# Async Runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "net", "test-util"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error Handling
+anyhow = "1"
+thiserror = "1"
+
+# Spell-check engine (pure Rust, Hunspell-compatible)
+spellbook = "0.4.2"
+
+# Dictionary download / cache
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+directories = "5"
+tempfile = "3"
+
+# Tokenization
+regex = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.14", default-features = false }
+
+# Validation & Utilities
+validator = { version = "0.18", features = ["derive"] }
+once_cell = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+criterion = "0.5"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[[bench]]
+name = "spellcheck_bench"
+harness = false
