@@ -30,7 +30,7 @@
 ## Documentation
 
 - Add inline doc comments for public APIs.
-- Keep `README.md` and `docs/*.md` accurate.
+- Keep `README.md` and `*.md` files accurate.
 - Update `openapi.json` when the API contract changes.
 
 ## Performance

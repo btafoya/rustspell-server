@@ -43,7 +43,7 @@ Update dictionary manager to support custom refresh intervals
 
 ## Documentation
 
-Update `README.md` and relevant `docs/*.md` files when behavior, configuration, or deployment instructions change.
+Update `README.md` and relevant `*.md` files when behavior, configuration, or deployment instructions change.
 
 ## License
 
