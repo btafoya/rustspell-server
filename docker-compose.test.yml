@@ -1,0 +1,45 @@
+services:
+  rustspell-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      RUSTSPELL_PORT: 3000
+      RUSTSPELL_METRICS_PORT: 9090
+      RUSTSPELL_DB_PATH: /data/rustspell.db
+      RUSTSPELL_DICTIONARY_DIR: /data/dictionaries
+      RUSTSPELL_BOOTSTRAP_SECRETS_PATH: /run/secrets/bootstrap.json
+      RUSTSPELL_LOG_LEVEL: warn
+    volumes:
+      - test-data:/data
+      - test-secrets:/run/secrets
+    expose:
+      - "3000"
+      - "9090"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  rustspell-tester:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      rustspell-server:
+        condition: service_healthy
+    environment:
+      RUSTSPELL_SERVER_URL: http://rustspell-server:3000
+      RUSTSPELL_PLATFORM_KEY_FILE: /run/secrets/bootstrap.json
+      RUSTSPELL_TEST_REPORT_DIR: /app/test-reports
+    volumes:
+      - test-secrets:/run/secrets:ro
+      - test-reports:/app/test-reports
+    entrypoint: ["/app/tests/bats/run_tests_external.sh"]
+
+volumes:
+  test-data:
+  test-secrets:
+  test-reports:

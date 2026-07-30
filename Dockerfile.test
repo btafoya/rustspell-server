@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+
+# Test runner image. Builds the server binary, installs bats/curl/jq, and
+# uses tests/bats/run_tests.sh as the entrypoint. The entrypoint starts a
+# fresh server inside the container, waits for /health, runs the bats suite,
+# and tears the server down.
+
+FROM rust:1-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bats curl jq ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY benches ./benches
+COPY openapi.json ./
+COPY tests/bats ./tests/bats
+
+RUN cargo build --release --bin rustspell-server
+
+ENV RUSTSPELL_SERVER_BIN=/app/target/release/rustspell-server
+ENV RUSTSPELL_TEST_REPORT_DIR=/app/test-reports
+
+ENTRYPOINT ["/app/tests/bats/run_tests.sh"]

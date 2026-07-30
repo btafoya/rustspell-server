@@ -119,6 +119,7 @@ Environment variables:
 | `RUSTSPELL_REFRESH_INTERVAL_HOURS` | `24` | Re-download if cache is older than this |
 | `RUSTSPELL_DB_PATH` | OS data directory | SQLite file for the key/tenant store, used when `RUSTSPELL_DB_URL` is unset |
 | `RUSTSPELL_DB_URL` | — | PostgreSQL connection string (`postgres://...`); takes precedence over `RUSTSPELL_DB_PATH` when set |
+| `RUSTSPELL_BOOTSTRAP_SECRETS_PATH` | — | Path to write `{"platform_key":"..."}` when a bootstrap platform key is created |
 | `RUSTSPELL_AUTH_RATE_LIMIT_MAX` | `10` | Auth failures allowed per IP per window before a cooldown |
 | `RUSTSPELL_AUTH_RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window (seconds) for counting auth failures |
 | `RUSTSPELL_AUTH_RATE_LIMIT_COOLDOWN_SECONDS` | `60` | Cooldown (seconds) once the failure threshold is exceeded |
@@ -126,6 +127,69 @@ Environment variables:
 `RUSTSPELL_PORT` and `RUSTSPELL_METRICS_PORT` must be different. There's no
 `RUSTSPELL_CORS_ORIGINS` — CORS is per-tenant, managed via `POST /tenant/origins`
 (see [Quick Start](#quick-start)), not a startup env var.
+
+### Bootstrap Secrets File
+
+For automated provisioning and testing, the server can write the freshly created
+bootstrap platform key to a JSON file:
+
+```bash
+RUSTSPELL_BOOTSTRAP_SECRETS_PATH=/run/secrets/bootstrap.json ./target/release/rustspell-server
+```
+
+The file is only written when a new platform key is bootstrapped, and contains:
+
+```json
+{ "platform_key": "rsk_..." }
+```
+
+## Live API Testing
+
+A live-call test suite validates every operation in `openapi.json` against a
+real server process using `bats` and `curl`. The suite is gated by the
+`live-tests` Cargo feature.
+
+```bash
+# Requires bats and curl on PATH.
+cargo test --features live-tests --test live_api_tester
+```
+
+By default the harness builds/spawns the server on random free ports, creates a
+fresh SQLite database, and tears everything down after the bats suite finishes.
+Alternatively, point it at an already-running server:
+
+```bash
+RUSTSPELL_SERVER_URL=http://localhost:3000 \
+RUSTSPELL_PLATFORM_KEY=rsk_... \
+cargo test --features live-tests --test live_api_tester
+```
+
+A coverage test (`tests/live_api_coverage.rs`) verifies that every
+`operationId` in `openapi.json` is mapped to a bats test in
+`tests/bats/MANIFEST.json`.
+
+The suite can also produce JSON and JUnit reports:
+
+```bash
+RUSTSPELL_TEST_REPORT=all \
+RUSTSPELL_TEST_REPORT_DIR=target/live-test-reports \
+cargo test --features live-tests --test live_api_tester
+```
+
+### Docker Testing
+
+Run the live suite inside a single container:
+
+```bash
+docker build -f Dockerfile.test -t rustspell-tester .
+docker run --rm rustspell-tester
+```
+
+Or run it against a separate server container:
+
+```bash
+docker compose -f docker-compose.test.yml up --build --exit-code-from rustspell-tester
+```
 
 ## Metrics
 

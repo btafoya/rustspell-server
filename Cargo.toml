@@ -49,6 +49,10 @@ swagger-ui-dist = { version = "5.32", default-features = false, features = ["wit
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "any", "sqlite", "postgres"] }
 sha2 = "0.10"
 
+[features]
+default = []
+live-tests = []
+
 [dev-dependencies]
 criterion = "0.5"
 tower = { version = "0.5", features = ["util"] }

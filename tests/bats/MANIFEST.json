@@ -1,0 +1,22 @@
+{
+  "covered_operations": [
+    "healthCheck",
+    "getOpenApiSpec",
+    "spellcheck",
+    "spellcheckPositions",
+    "createApiKey",
+    "listApiKeys",
+    "revokeApiKey",
+    "rotateApiKey",
+    "getOwnTenant",
+    "listOwnOrigins",
+    "registerOrigin",
+    "revokeOrigin",
+    "createTenant",
+    "listTenants",
+    "getTenant",
+    "updateTenant",
+    "suspendTenant",
+    "reactivateTenant"
+  ]
+}

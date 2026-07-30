@@ -38,12 +38,18 @@ async fn main() -> anyhow::Result<()> {
     // Open the key/tenant store; print the bootstrap platform key if this is
     // the first start (or the store was emptied of active platform keys).
     let (store, bootstrap_key) = Store::open(&config).await?;
-    if let Some(created) = bootstrap_key {
+    if let Some(created) = &bootstrap_key {
         println!(
             "Bootstrap platform API key (save this now, it will not be shown again):\n  {}",
             created.raw_key
         );
         tracing::info!("bootstrap platform API key created");
+
+        if let Ok(path) = std::env::var("RUSTSPELL_BOOTSTRAP_SECRETS_PATH") {
+            if let Err(e) = write_bootstrap_secrets(&path, &created.raw_key) {
+                tracing::warn!("failed to write bootstrap secrets file at {path}: {e}");
+            }
+        }
     }
 
     let rate_limiter = auth::RateLimiter::new(
@@ -116,4 +122,14 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("SIGINT received, starting graceful shutdown"),
         _ = term => tracing::info!("SIGTERM received, starting graceful shutdown"),
     }
+}
+
+/// Write the freshly bootstrapped platform key to a JSON file so external
+/// tooling (e.g., the live API test suite) can authenticate without scraping
+/// stdout. The file is only written when a new bootstrap key is created.
+fn write_bootstrap_secrets(path: &str, platform_key: &str) -> anyhow::Result<()> {
+    let secrets = serde_json::json!({ "platform_key": platform_key });
+    let contents = serde_json::to_string_pretty(&secrets)?;
+    std::fs::write(path, contents)?;
+    Ok(())
 }
