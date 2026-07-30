@@ -66,6 +66,31 @@ Environment variables:
 
 `RUSTSPELL_PORT` and `RUSTSPELL_METRICS_PORT` must be different.
 
+## Metrics
+
+Prometheus metrics are served on a separate port (`RUSTSPELL_METRICS_PORT`,
+default `9090`) at `/metrics` — not on the public API port.
+
+```bash
+curl http://localhost:9090/metrics
+```
+
+Exposed metrics:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|--------------|
+| `http_requests_total` | counter | `method`, `path`, `status` | Total requests processed |
+| `http_request_duration_seconds` | histogram | `method`, `path` | Request latency |
+
+### Prometheus scrape config
+
+```yaml
+scrape_configs:
+  - job_name: rustspell-server
+    static_configs:
+      - targets: ["localhost:9090"]
+```
+
 ## Deployment
 
 ### Docker
