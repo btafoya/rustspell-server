@@ -6,11 +6,12 @@
 use std::sync::Arc;
 
 use rustspell_server::{
-    config,
+    auth, config,
     dictionary::DictionaryManager,
-    engine::Engine,
+    engine::{Engine, EngineRegistry},
     handlers::{self, AppState},
     metrics,
+    store::Store,
 };
 
 #[tokio::main]
@@ -29,10 +30,34 @@ async fn main() -> anyhow::Result<()> {
 
     // Download/load dictionary
     let dict_manager = DictionaryManager::new(&config);
-    let (aff_path, dic_path) = dict_manager.ensure_dictionary().await?;
+    let (aff_path, dic_path) = dict_manager.ensure_dictionary(&config.language).await?;
     ::metrics::counter!("dictionary_refresh_total", "result" => "success").increment(1);
     let engine = Engine::load_from_paths(&aff_path, &dic_path)?;
-    let app_state = Arc::new(AppState::new(Arc::new(engine), Arc::new(config.clone())));
+    let engines = EngineRegistry::new(config.language.clone(), engine, dict_manager);
+
+    // Open the key/tenant store; print the bootstrap platform key if this is
+    // the first start (or the store was emptied of active platform keys).
+    let (store, bootstrap_key) = Store::open(&config).await?;
+    if let Some(created) = bootstrap_key {
+        println!(
+            "Bootstrap platform API key (save this now, it will not be shown again):\n  {}",
+            created.raw_key
+        );
+        tracing::info!("bootstrap platform API key created");
+    }
+
+    let rate_limiter = auth::RateLimiter::new(
+        config.auth_rate_limit_max,
+        std::time::Duration::from_secs(config.auth_rate_limit_window_seconds),
+        std::time::Duration::from_secs(config.auth_rate_limit_cooldown_seconds),
+    );
+
+    let app_state = Arc::new(AppState::new(
+        Arc::new(engines),
+        Arc::new(config.clone()),
+        Arc::new(store),
+        Arc::new(rate_limiter),
+    ));
 
     // Build public API router
     let app = handlers::build_app(app_state);
@@ -53,12 +78,16 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Run API server with graceful shutdown
+    // Run API server with graceful shutdown. Connect info is required for
+    // per-IP auth-failure rate limiting (see `auth::require_active_key`).
     let shutdown = shutdown_signal();
-    axum::serve(api_listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|e| anyhow::anyhow!("API server error: {e}"))?;
+    axum::serve(
+        api_listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .map_err(|e| anyhow::anyhow!("API server error: {e}"))?;
     tracing::info!("API server shut down gracefully");
 
     Ok(())

@@ -1,16 +1,20 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{body::Body, http::Request};
 use criterion::{criterion_group, criterion_main, Criterion};
 use rustspell_server::{
+    auth::RateLimiter,
     config::Config,
-    engine::Engine,
+    dictionary::DictionaryManager,
+    engine::{Engine, EngineRegistry},
     handlers::{build_app, AppState},
+    store::{Role, Store},
 };
 use serde_json::json;
 use tower::ServiceExt;
 
-fn test_app() -> axum::Router {
+async fn test_app() -> (axum::Router, String) {
     let aff = r"SET UTF-8
 TRY abc
 ";
@@ -18,8 +22,8 @@ TRY abc
 hello
 world
 ";
-    let engine = Arc::new(Engine::new(aff, dic).unwrap());
-    let config = Arc::new(Config {
+    let engine = Engine::new(aff, dic).unwrap();
+    let config = Config {
         port: 3000,
         metrics_port: 9090,
         log_level: "info".to_string(),
@@ -27,17 +31,45 @@ world
         dictionary_url: "https://example.com".to_string(),
         dictionary_dir: std::path::PathBuf::from("/tmp"),
         refresh_interval_hours: 24,
-        cors_origins: vec![axum::http::HeaderValue::from_static(
-            "http://localhost:3000",
-        )],
-    });
-    let state = Arc::new(AppState::new(engine, config));
-    build_app(state)
+        db_path: std::path::PathBuf::from("/tmp/rustspell-bench.db"),
+        db_url: Some("sqlite::memory:".to_string()),
+        auth_rate_limit_max: 10,
+        auth_rate_limit_window_seconds: 60,
+        auth_rate_limit_cooldown_seconds: 60,
+    };
+    let dictionary_manager = DictionaryManager::new(&config);
+    let engines = Arc::new(EngineRegistry::new(
+        config.language.clone(),
+        engine,
+        dictionary_manager,
+    ));
+    let (store, _bootstrap) = Store::open(&config).await.unwrap();
+    let (tenant, _admin_key) = store
+        .create_tenant("Bench Tenant".to_string(), None, None, None, None)
+        .await
+        .unwrap();
+    let key = store
+        .create_key(&tenant.id, "bench".to_string(), Role::Standard, None)
+        .await
+        .unwrap()
+        .raw_key;
+    let rate_limiter = Arc::new(RateLimiter::new(
+        config.auth_rate_limit_max,
+        Duration::from_secs(config.auth_rate_limit_window_seconds),
+        Duration::from_secs(config.auth_rate_limit_cooldown_seconds),
+    ));
+    let state = Arc::new(AppState::new(
+        engines,
+        Arc::new(config),
+        Arc::new(store),
+        rate_limiter,
+    ));
+    (build_app(state), key)
 }
 
 fn spellcheck_benchmark(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let app = test_app();
+    let (app, key) = rt.block_on(test_app());
     let body = json!({ "words": ["hello", "wrld", "hello", "wrld", "hello", "wrld"] });
     let body_bytes = axum::body::Bytes::from(body.to_string());
 
@@ -47,6 +79,7 @@ fn spellcheck_benchmark(c: &mut Criterion) {
                 .method("POST")
                 .uri("/spellcheck")
                 .header("content-type", "application/json")
+                .header("x-api-key", &key)
                 .body(Body::from(body_bytes.clone()))
                 .unwrap();
             let response = rt.block_on(app.clone().oneshot(request)).unwrap();

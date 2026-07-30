@@ -6,9 +6,26 @@ services:
       - "9090:9090"
     environment:
       RUSTSPELL_LANGUAGE: en_US
-      RUSTSPELL_CORS_ORIGINS: http://localhost:3000
     volumes:
-      - dict-cache:/data/dictionaries
+      # Whole /data, not just /data/dictionaries — RUSTSPELL_DB_PATH also
+      # lives under /data (see Dockerfile), and both need to survive restarts.
+      - data:/data
+
+  # Opt-in: `docker compose --profile postgres up` to run the key/tenant
+  # store on Postgres instead of the default bundled SQLite. Not started by
+  # plain `docker compose up`.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: rustspell
+      POSTGRES_USER: rustspell
+      POSTGRES_PASSWORD: rustspell
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
 
 volumes:
-  dict-cache:
+  data:
+  postgres-data:

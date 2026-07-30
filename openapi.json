@@ -3,7 +3,7 @@
   "info": {
     "title": "Rust Spell Server",
     "version": "0.1.0",
-    "description": "Hunspell-compatible spell-checking REST API",
+    "description": "A production-ready Rust HTTP server exposing a spell-checking API over OpenAPI-compliant endpoints.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -22,6 +22,644 @@
   ],
   "security": [],
   "paths": {
+    "/api-keys": {
+      "post": {
+        "operationId": "createApiKey",
+        "tags": ["API Keys"],
+        "summary": "Create an API key",
+        "description": "Creates a new `admin` or `standard` key scoped to the caller's own tenant. The raw key value is returned exactly once.",
+        "security": [{ "apiKeyAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateApiKeyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Key created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreatedApiKeyResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many failed authentication attempts from this IP",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listApiKeys",
+        "tags": ["API Keys"],
+        "summary": "List API keys",
+        "description": "Returns metadata for all keys belonging to the caller's own tenant. Raw and hashed values are never returned.",
+        "security": [{ "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Key metadata list",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiKeyListResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api-keys/{id}": {
+      "delete": {
+        "operationId": "revokeApiKey",
+        "tags": ["API Keys"],
+        "summary": "Revoke an API key",
+        "description": "Soft-revokes a key belonging to the caller's own tenant. Idempotent: revoking an already-revoked key still returns 204.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Key revoked (or already revoked)" },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown key id, or the id belongs to a different tenant",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api-keys/{id}/rotate": {
+      "post": {
+        "operationId": "rotateApiKey",
+        "tags": ["API Keys"],
+        "summary": "Rotate an API key",
+        "description": "Issues a new raw value for an existing key, invalidating the previous value. The id, label, and role are unchanged; the raw key is returned exactly once.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Key rotated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreatedApiKeyResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown key id, or the id belongs to a different tenant",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenant": {
+      "get": {
+        "operationId": "getOwnTenant",
+        "tags": ["Tenants"],
+        "summary": "Get own tenant",
+        "description": "Returns metadata for the calling key's own tenant. Callable by `admin` or `standard` keys (read-only self-service usage visibility).",
+        "security": [{ "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Tenant metadata",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantMetadata" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Origin not registered to the caller's tenant, or the tenant is suspended",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenant/origins": {
+      "get": {
+        "operationId": "listOwnOrigins",
+        "tags": ["Origins"],
+        "summary": "List registered origins",
+        "description": "Returns the caller's own tenant's registered CORS origins.",
+        "security": [{ "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Origin list",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/OriginListResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role, origin not registered to the caller's tenant, or the tenant is suspended",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "registerOrigin",
+        "tags": ["Origins"],
+        "summary": "Register an origin",
+        "description": "Registers a browser origin for the caller's own tenant, enabling CORS and passing server-side origin binding for that origin.",
+        "security": [{ "apiKeyAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RegisterOriginRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Origin registered",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/OriginMetadata" }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role, origin not registered to the caller's tenant, or the tenant is suspended",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenant/origins/{id}": {
+      "delete": {
+        "operationId": "revokeOrigin",
+        "tags": ["Origins"],
+        "summary": "Revoke a registered origin",
+        "description": "Removes an origin belonging to the caller's own tenant.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Origin revoked" },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the admin role, origin not registered to the caller's tenant, or the tenant is suspended",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown origin id, or the id belongs to a different tenant",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenants": {
+      "post": {
+        "operationId": "createTenant",
+        "tags": ["Tenants"],
+        "summary": "Create a tenant",
+        "description": "Creates a tenant and its first `admin`-role key in one call. Platform key only; the request must not carry an `Origin` header.",
+        "security": [{ "apiKeyAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateTenantRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tenant and its first admin key",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreatedTenant" }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the platform role, or the request carries an Origin header (platform keys are server-to-server only)",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "listTenants",
+        "tags": ["Tenants"],
+        "summary": "List tenants",
+        "description": "Platform key only.",
+        "security": [{ "apiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Tenant list",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantListResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the platform role, or the request carries an Origin header",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenants/{id}": {
+      "get": {
+        "operationId": "getTenant",
+        "tags": ["Tenants"],
+        "summary": "Get a tenant",
+        "description": "Platform key only.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tenant metadata",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantMetadata" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the platform role, or the request carries an Origin header",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown tenant id",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateTenant",
+        "tags": ["Tenants"],
+        "summary": "Update a tenant",
+        "description": "Platform key only. Sets quota, billing period, name, and/or default language.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateTenantRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated tenant metadata",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TenantMetadata" }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the platform role, or the request carries an Origin header",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown tenant id",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenants/{id}/suspend": {
+      "post": {
+        "operationId": "suspendTenant",
+        "tags": ["Tenants"],
+        "summary": "Suspend a tenant",
+        "description": "Platform key only. All of the tenant's keys are rejected (403) until reactivated, independent of quota state.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Tenant suspended" },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the platform role, or the request carries an Origin header",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown tenant id",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tenants/{id}/reactivate": {
+      "post": {
+        "operationId": "reactivateTenant",
+        "tags": ["Tenants"],
+        "summary": "Reactivate a suspended tenant",
+        "description": "Platform key only.",
+        "security": [{ "apiKeyAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Tenant reactivated" },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "403": {
+            "description": "Key does not have the platform role, or the request carries an Origin header",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown tenant id",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "operationId": "healthCheck",
@@ -91,6 +729,7 @@
         "tags": ["Spell-check"],
         "summary": "Spell-check tokens",
         "description": "Accepts text and/or an explicit word list and returns one result per token occurrence.",
+        "security": [{ "apiKeyAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -109,7 +748,23 @@
             }
           },
           "400": {
-            "description": "Validation error",
+            "description": "Validation error (neither `text` nor `words` provided, or malformed `language`), or `language` is a well-formed but unloadable code (download/parse failure).",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited or over quota. Two distinct causes share this status: too many failed authentication attempts from this IP (`type` ends in `rate-limited`, retries after `Retry-After` seconds), or the tenant's request quota is exhausted for the current billing period (`type` ends in `quota-exceeded`, no `Retry-After` — resolved by the platform/billing app via `PATCH /tenants/{id}`, not by waiting).",
             "content": {
               "application/problem+json": {
                 "schema": { "$ref": "#/components/schemas/ProblemDetails" }
@@ -133,6 +788,7 @@
         "tags": ["Spell-check"],
         "summary": "Spell-check with token positions",
         "description": "Returns unique misspelled tokens and their char positions in the provided text.",
+        "security": [{ "apiKeyAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -151,7 +807,23 @@
             }
           },
           "400": {
-            "description": "Validation error",
+            "description": "Validation error (neither `text` nor `words` provided, or malformed `language`), or `language` is a well-formed but unloadable code (download/parse failure).",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetails" }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited or over quota. Two distinct causes share this status: too many failed authentication attempts from this IP (`type` ends in `rate-limited`, retries after `Retry-After` seconds), or the tenant's request quota is exhausted for the current billing period (`type` ends in `quota-exceeded`, no `Retry-After` — resolved by the platform/billing app via `PATCH /tenants/{id}`, not by waiting).",
             "content": {
               "application/problem+json": {
                 "schema": { "$ref": "#/components/schemas/ProblemDetails" }
@@ -196,6 +868,11 @@
             "maxItems": 1000,
             "items": { "type": "string" },
             "description": "Explicit list of words to spell-check"
+          },
+          "language": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,20}$",
+            "description": "Overrides the calling tenant's default language for this request. Downloaded and cached on first use if not already loaded; an unloadable language returns 400, not 500."
           }
         }
       },
@@ -257,6 +934,186 @@
           "status": { "type": "integer" },
           "detail": { "type": "string" }
         }
+      },
+      "Role": {
+        "type": "string",
+        "enum": ["admin", "standard"],
+        "description": "`platform` also exists internally but is never accepted or returned by these endpoints — it's only ever bootstrap-created."
+      },
+      "CreateApiKeyRequest": {
+        "type": "object",
+        "required": ["label", "role"],
+        "properties": {
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Human-readable name to distinguish this key from others."
+          },
+          "role": { "$ref": "#/components/schemas/Role" },
+          "expires_at": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Unix-epoch seconds. Omit for a key that never expires."
+          }
+        }
+      },
+      "ApiKeyMetadata": {
+        "type": "object",
+        "required": ["id", "label", "role", "created_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "role": { "$ref": "#/components/schemas/Role" },
+          "created_at": { "type": "integer" },
+          "expires_at": { "type": "integer", "nullable": true },
+          "last_used_at": { "type": "integer", "nullable": true },
+          "revoked_at": { "type": "integer", "nullable": true }
+        }
+      },
+      "CreatedApiKeyResponse": {
+        "description": "`ApiKeyMetadata` plus the raw key value, returned exactly once (on creation or rotation).",
+        "allOf": [
+          { "$ref": "#/components/schemas/ApiKeyMetadata" },
+          {
+            "type": "object",
+            "required": ["key"],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "Raw key value. Not persisted, not retrievable again — save it now."
+              }
+            }
+          }
+        ]
+      },
+      "ApiKeyListResponse": {
+        "type": "object",
+        "required": ["keys"],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ApiKeyMetadata" }
+          }
+        }
+      },
+      "CreateTenantRequest": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "language": {
+            "type": "string",
+            "nullable": true,
+            "description": "Defaults to en_US if omitted."
+          },
+          "quota_limit": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Max /spellcheck* requests per billing period. 0 or omitted means unlimited."
+          },
+          "period_start": { "type": "integer", "nullable": true },
+          "period_end": { "type": "integer", "nullable": true }
+        }
+      },
+      "UpdateTenantRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "language": { "type": "string" },
+          "quota_limit": { "type": "integer" },
+          "period_start": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Omit to leave unchanged, null to clear, a number to set."
+          },
+          "period_end": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Omit to leave unchanged, null to clear, a number to set."
+          }
+        }
+      },
+      "TenantMetadata": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "language",
+          "quota_limit",
+          "request_count",
+          "created_at"
+        ],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "language": { "type": "string" },
+          "quota_limit": { "type": "integer" },
+          "request_count": { "type": "integer" },
+          "period_start": { "type": "integer", "nullable": true },
+          "period_end": { "type": "integer", "nullable": true },
+          "suspended_at": { "type": "integer", "nullable": true },
+          "created_at": { "type": "integer" }
+        }
+      },
+      "CreatedTenant": {
+        "description": "`TenantMetadata` plus its first admin key, returned exactly once.",
+        "allOf": [
+          { "$ref": "#/components/schemas/TenantMetadata" },
+          {
+            "type": "object",
+            "required": ["admin_key"],
+            "properties": {
+              "admin_key": { "$ref": "#/components/schemas/CreatedApiKeyResponse" }
+            }
+          }
+        ]
+      },
+      "TenantListResponse": {
+        "type": "object",
+        "required": ["tenants"],
+        "properties": {
+          "tenants": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TenantMetadata" }
+          }
+        }
+      },
+      "RegisterOriginRequest": {
+        "type": "object",
+        "required": ["origin"],
+        "properties": {
+          "origin": {
+            "type": "string",
+            "description": "A bare http(s) origin with no path, e.g. https://app.example.com."
+          }
+        }
+      },
+      "OriginMetadata": {
+        "type": "object",
+        "required": ["id", "origin", "created_at"],
+        "properties": {
+          "id": { "type": "string" },
+          "origin": { "type": "string" },
+          "created_at": { "type": "integer" }
+        }
+      },
+      "OriginListResponse": {
+        "type": "object",
+        "required": ["origins"],
+        "properties": {
+          "origins": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OriginMetadata" }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "apiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
       }
     }
   }

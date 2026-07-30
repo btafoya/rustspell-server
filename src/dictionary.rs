@@ -31,9 +31,8 @@ pub enum DictionaryError {
 
 /// Manages dictionary cache lifecycle.
 pub struct DictionaryManager {
-    language: String,
     base_url: String,
-    cache_dir: PathBuf,
+    dictionary_dir: PathBuf,
     refresh_interval: Duration,
 }
 
@@ -41,42 +40,49 @@ impl DictionaryManager {
     /// Build a manager from runtime configuration.
     pub fn new(config: &Config) -> Self {
         Self {
-            language: config.language.clone(),
             base_url: config.dictionary_url.clone(),
-            cache_dir: config.dictionary_dir.join(&config.language),
+            dictionary_dir: config.dictionary_dir.clone(),
             refresh_interval: Duration::from_secs(config.refresh_interval_hours * 3600),
         }
     }
 
-    /// Return the paths to the cached `.aff` and `.dic` files, downloading if needed.
-    pub async fn ensure_dictionary(&self) -> Result<(PathBuf, PathBuf), DictionaryError> {
-        let aff_path = self.cache_dir.join(format!("{}.aff", self.language));
-        let dic_path = self.cache_dir.join(format!("{}.dic", self.language));
+    /// Return the paths to the cached `.aff` and `.dic` files for `language`,
+    /// downloading if needed. Parameterized rather than fixed to the
+    /// server's configured default language so `EngineRegistry` (§25) can
+    /// load any requested language on demand, not just the one loaded at
+    /// startup.
+    pub async fn ensure_dictionary(
+        &self,
+        language: &str,
+    ) -> Result<(PathBuf, PathBuf), DictionaryError> {
+        let cache_dir = self.dictionary_dir.join(language);
+        let aff_path = cache_dir.join(format!("{language}.aff"));
+        let dic_path = cache_dir.join(format!("{language}.dic"));
 
         if self.is_fresh(&aff_path, &dic_path).await {
             return Ok((aff_path, dic_path));
         }
 
         tracing::info!(
-            "dictionary cache missing or stale; downloading from {}",
+            "dictionary cache missing or stale; downloading {language} from {}",
             self.base_url
         );
 
-        tokio::fs::create_dir_all(&self.cache_dir)
+        tokio::fs::create_dir_all(&cache_dir)
             .await
             .map_err(|e| DictionaryError::CreateDir {
-                path: self.cache_dir.display().to_string(),
+                path: cache_dir.display().to_string(),
                 source: e,
             })?;
 
-        let aff_url = format!("{}/{}.aff", self.base_url, self.language);
-        let dic_url = format!("{}/{}.dic", self.base_url, self.language);
+        let aff_url = format!("{}/{language}.aff", self.base_url);
+        let dic_url = format!("{}/{language}.dic", self.base_url);
 
         let aff_data = self.download(&aff_url).await?;
         let dic_data = self.download(&dic_url).await?;
 
-        self.atomic_write(&aff_path, aff_data).await?;
-        self.atomic_write(&dic_path, dic_data).await?;
+        self.atomic_write(&cache_dir, &aff_path, aff_data).await?;
+        self.atomic_write(&cache_dir, &dic_path, dic_data).await?;
 
         Ok((aff_path, dic_path))
     }
@@ -160,10 +166,15 @@ impl DictionaryManager {
         err.is_connect() || err.is_timeout()
     }
 
-    async fn atomic_write(&self, dest: &Path, data: Vec<u8>) -> Result<(), DictionaryError> {
+    async fn atomic_write(
+        &self,
+        cache_dir: &Path,
+        dest: &Path,
+        data: Vec<u8>,
+    ) -> Result<(), DictionaryError> {
         let temp_dir = tempfile::Builder::new()
             .prefix("rustspell-dict-")
-            .tempdir_in(&self.cache_dir)
+            .tempdir_in(cache_dir)
             .map_err(|e| DictionaryError::Write {
                 path: dest.display().to_string(),
                 source: e,
@@ -201,7 +212,11 @@ mod tests {
             dictionary_url: "https://example.com/dict".to_string(),
             dictionary_dir: dict_dir,
             refresh_interval_hours: 24,
-            cors_origins: vec![],
+            db_path: PathBuf::from("/tmp/rustspell-dictionary-test.db"),
+            db_url: None,
+            auth_rate_limit_max: 10,
+            auth_rate_limit_window_seconds: 60,
+            auth_rate_limit_cooldown_seconds: 60,
         }
     }
 

@@ -21,6 +21,18 @@ pub enum AppError {
     DictionaryParse(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("missing or invalid API key")]
+    Unauthorized,
+    #[error("insufficient permissions for this key")]
+    Forbidden,
+    #[error("too many failed authentication attempts")]
+    RateLimited { retry_after_secs: u64 },
+    #[error("resource not found")]
+    NotFound,
+    #[error("tenant request quota exceeded")]
+    QuotaExceeded,
+    #[error("unsupported language: {0}")]
+    UnsupportedLanguage(String),
 }
 
 /// RFC 7807 Problem Details object.
@@ -40,6 +52,12 @@ impl AppError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
+            AppError::UnsupportedLanguage(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -50,6 +68,12 @@ impl AppError {
             AppError::DictionaryDownload(_) => "dictionary-download-error",
             AppError::DictionaryParse(_) => "dictionary-parse-error",
             AppError::Internal(_) => "internal-error",
+            AppError::Unauthorized => "unauthorized",
+            AppError::Forbidden => "forbidden",
+            AppError::RateLimited { .. } => "rate-limited",
+            AppError::NotFound => "not-found",
+            AppError::QuotaExceeded => "quota-exceeded",
+            AppError::UnsupportedLanguage(_) => "unsupported-language",
         };
         format!("https://github.com/btafoya/rustspell-server/blob/main/docs/errors/{slug}.md")
     }
@@ -61,6 +85,12 @@ impl AppError {
             AppError::DictionaryDownload(_) => "Dictionary download error",
             AppError::DictionaryParse(_) => "Dictionary parse error",
             AppError::Internal(_) => "Internal server error",
+            AppError::Unauthorized => "Unauthorized",
+            AppError::Forbidden => "Forbidden",
+            AppError::RateLimited { .. } => "Too many requests",
+            AppError::NotFound => "Not found",
+            AppError::QuotaExceeded => "Quota exceeded",
+            AppError::UnsupportedLanguage(_) => "Unsupported language",
         }
     }
 }
@@ -68,6 +98,10 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let retry_after_secs = match &self {
+            AppError::RateLimited { retry_after_secs } => Some(*retry_after_secs),
+            _ => None,
+        };
         let body = ProblemDetails {
             r#type: self.problem_type(),
             title: self.title().to_string(),
@@ -75,12 +109,22 @@ impl IntoResponse for AppError {
             detail: self.to_string(),
         };
 
-        (
+        let mut response = (
             status,
             [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
             Json(body),
         )
-            .into_response()
+            .into_response();
+
+        if let Some(secs) = retry_after_secs {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+
+        response
     }
 }
 
@@ -105,5 +149,16 @@ mod tests {
         assert!(err
             .problem_type()
             .starts_with("https://github.com/btafoya/rustspell-server/blob/main/docs/errors/"));
+    }
+
+    #[test]
+    fn quota_exceeded_and_rate_limited_are_distinct_429s() {
+        let quota = AppError::QuotaExceeded;
+        let rate_limited = AppError::RateLimited {
+            retry_after_secs: 30,
+        };
+        assert_eq!(quota.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rate_limited.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_ne!(quota.problem_type(), rate_limited.problem_type());
     }
 }
