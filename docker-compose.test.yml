@@ -37,7 +37,7 @@ services:
     volumes:
       - test-secrets:/run/secrets:ro
       - test-reports:/app/test-reports
-    entrypoint: ["/app/tests/bats/run_tests_external.sh"]
+    entrypoint: ["cargo", "test", "--features", "live-tests", "--test", "live_api_tester"]
 
 volumes:
   test-data:

@@ -344,6 +344,30 @@ async fn spellcheck_rejects_missing_input() {
 }
 
 #[tokio::test]
+async fn malformed_json_body_returns_bad_request() {
+    let (app, store, _platform_key) = test_app().await;
+    let (_tenant_id, admin_key) = mint_admin_key(&store).await;
+    let body = json!({});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys")
+                .header("content-type", "application/json")
+                .header("x-api-key", admin_key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["status"], 400);
+    assert_eq!(body["title"], "Invalid JSON");
+}
+
+#[tokio::test]
 async fn spellcheck_positions_returns_misspelled_positions() {
     let (app, store, _platform_key) = test_app().await;
     let key = mint_standard_key(&store).await;

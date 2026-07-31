@@ -148,16 +148,15 @@ The file is only written when a new platform key is bootstrapped, and contains:
 ## Live API Testing
 
 A live-call test suite validates every operation in `openapi.json` against a
-real server process using `bats` and `curl`. The suite is gated by the
-`live-tests` Cargo feature.
+real server process over HTTP. The suite is gated by the `live-tests` Cargo
+feature and is written entirely in Rust.
 
 ```bash
-# Requires bats and curl on PATH.
 cargo test --features live-tests --test live_api_tester
 ```
 
 By default the harness builds/spawns the server on random free ports, creates a
-fresh SQLite database, and tears everything down after the bats suite finishes.
+fresh SQLite database, and tears everything down after the scenarios complete.
 Alternatively, point it at an already-running server:
 
 ```bash
@@ -165,10 +164,6 @@ RUSTSPELL_SERVER_URL=http://localhost:3000 \
 RUSTSPELL_PLATFORM_KEY=rsk_... \
 cargo test --features live-tests --test live_api_tester
 ```
-
-A coverage test (`tests/live_api_coverage.rs`) verifies that every
-`operationId` in `openapi.json` is mapped to a bats test in
-`tests/bats/MANIFEST.json`.
 
 The suite can also produce JSON and JUnit reports:
 

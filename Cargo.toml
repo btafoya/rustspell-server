@@ -58,6 +58,7 @@ criterion = "0.5"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 openapiv3 = "2.2.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [[bench]]
 name = "spellcheck_bench"

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{rejection::JsonRejection, Extension, Path, Query, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -131,8 +131,9 @@ async fn resolve_engine(
 pub async fn spellcheck(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<KeyRecord>,
-    Json(req): Json<SpellCheckRequest>,
+    req: std::result::Result<Json<SpellCheckRequest>, JsonRejection>,
 ) -> Result<Json<SpellCheckResponse>> {
+    let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
@@ -160,8 +161,9 @@ pub async fn spellcheck(
 pub async fn spellcheck_positions(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<KeyRecord>,
-    Json(req): Json<SpellCheckRequest>,
+    req: std::result::Result<Json<SpellCheckRequest>, JsonRejection>,
 ) -> Result<Json<PositionsResponse>> {
+    let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
@@ -230,8 +232,9 @@ fn token_result(engine: &Engine, token: &str) -> TokenResult {
 pub async fn create_api_key(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<KeyRecord>,
-    Json(req): Json<CreateApiKeyRequest>,
+    req: std::result::Result<Json<CreateApiKeyRequest>, JsonRejection>,
 ) -> Result<Json<CreatedApiKeyResponse>> {
+    let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
@@ -363,8 +366,9 @@ pub async fn list_own_origins(
 pub async fn register_origin(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<KeyRecord>,
-    Json(req): Json<RegisterOriginRequest>,
+    req: std::result::Result<Json<RegisterOriginRequest>, JsonRejection>,
 ) -> Result<Json<OriginMetadata>> {
+    let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
@@ -411,8 +415,9 @@ pub async fn revoke_origin(
 /// in one call.
 pub async fn create_tenant(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateTenantRequest>,
+    req: std::result::Result<Json<CreateTenantRequest>, JsonRejection>,
 ) -> Result<Json<CreatedTenant>> {
+    let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
@@ -461,8 +466,9 @@ pub async fn get_tenant(
 pub async fn update_tenant(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateTenantRequest>,
+    req: std::result::Result<Json<UpdateTenantRequest>, JsonRejection>,
 ) -> Result<Json<TenantMetadata>> {
+    let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
@@ -750,7 +756,7 @@ world
             last_used_at: None,
             revoked_at: None,
         };
-        let res = spellcheck(State(state), Extension(caller), Json(req)).await;
+        let res = spellcheck(State(state), Extension(caller), Ok(Json(req))).await;
         assert!(res.is_err());
     }
 }
