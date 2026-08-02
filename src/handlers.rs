@@ -29,11 +29,13 @@ use crate::metrics;
 use crate::middleware;
 use crate::models::{
     ApiKeyListResponse, ApiKeyMetadata, CreateApiKeyRequest, CreateTenantRequest,
-    CreatedApiKeyResponse, CreatedTenant, OriginListResponse, OriginMetadata, PositionResult,
-    PositionsResponse, RegisterOriginRequest, SpellCheckRequest, SpellCheckResponse,
-    TenantListResponse, TenantMetadata, TokenResult, UpdateTenantRequest,
+    CreatedApiKeyResponse, CreatedTenant, DailyUsageResponse, ErrorsResponse, LanguagesResponse,
+    LatencyResponse, OriginListResponse, OriginMetadata, PositionResult, PositionsResponse,
+    RegisterOriginRequest, SpellCheckRequest, SpellCheckResponse, TenantListResponse,
+    TenantMetadata, TokenResult, UpdateTenantRequest, UsageQuery,
 };
 use crate::store::{KeyRecord, Store};
+use crate::usage::{self, UsageRecorder, Window};
 
 /// Shared application state.
 pub struct AppState {
@@ -41,6 +43,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Arc<Store>,
     pub rate_limiter: Arc<auth::RateLimiter>,
+    pub usage: Arc<UsageRecorder>,
     pub start_time: Instant,
     pub request_count: AtomicU64,
 }
@@ -51,17 +54,25 @@ impl AppState {
         config: Arc<Config>,
         store: Arc<Store>,
         rate_limiter: Arc<auth::RateLimiter>,
+        usage: Arc<UsageRecorder>,
     ) -> Self {
         Self {
             engines,
             config,
             store,
             rate_limiter,
+            usage,
             start_time: Instant::now(),
             request_count: AtomicU64::new(0),
         }
     }
 }
+
+/// The language a spellcheck request actually resolved to, attached to the
+/// response so the usage recorder can group by it without re-deriving the
+/// override-or-tenant-default logic (`DESIGN.md` §26.3).
+#[derive(Debug, Clone)]
+pub struct ResolvedLanguage(pub String);
 
 #[derive(Debug, Deserialize)]
 pub struct HealthQuery {
@@ -100,11 +111,13 @@ pub async fn openapi_docs(State(_state): State<Arc<AppState>>) -> Response {
 /// caches the language on first use if it isn't already loaded (§25);
 /// `EngineError` (bad code, download/parse failure) maps to 400, not 500 —
 /// only the startup-time default language gets fail-fast treatment (§5.3).
+/// Returns the engine alongside the language it resolved to, so the handler
+/// can hand that language to the usage recorder (§26.3).
 async fn resolve_engine(
     state: &AppState,
     caller: &KeyRecord,
     requested_language: Option<&str>,
-) -> Result<Arc<Engine>> {
+) -> Result<(Arc<Engine>, String)> {
     let language = match requested_language {
         Some(language) => language.to_string(),
         None => {
@@ -120,11 +133,12 @@ async fn resolve_engine(
         }
     };
 
-    state
+    let engine = state
         .engines
         .get_or_load(&language)
         .await
-        .map_err(|e| AppError::UnsupportedLanguage(e.to_string()))
+        .map_err(|e| AppError::UnsupportedLanguage(e.to_string()))?;
+    Ok((engine, language))
 }
 
 /// `POST /spellcheck`
@@ -132,13 +146,13 @@ pub async fn spellcheck(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<KeyRecord>,
     req: std::result::Result<Json<SpellCheckRequest>, JsonRejection>,
-) -> Result<Json<SpellCheckResponse>> {
+) -> Result<(Extension<ResolvedLanguage>, Json<SpellCheckResponse>)> {
     let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
     let mut results = Vec::new();
-    let engine = resolve_engine(&state, &caller, req.language.as_deref()).await?;
+    let (engine, language) = resolve_engine(&state, &caller, req.language.as_deref()).await?;
 
     if let Some(text) = &req.text {
         for token in engine.tokenize(text) {
@@ -154,7 +168,10 @@ pub async fn spellcheck(
 
     ::metrics::counter!("spellcheck_tokens_total").increment(results.len() as u64);
 
-    Ok(Json(SpellCheckResponse { results }))
+    Ok((
+        Extension(ResolvedLanguage(language)),
+        Json(SpellCheckResponse { results }),
+    ))
 }
 
 /// `POST /spellcheck/positions`
@@ -162,12 +179,12 @@ pub async fn spellcheck_positions(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<KeyRecord>,
     req: std::result::Result<Json<SpellCheckRequest>, JsonRejection>,
-) -> Result<Json<PositionsResponse>> {
+) -> Result<(Extension<ResolvedLanguage>, Json<PositionsResponse>)> {
     let Json(req) = req?;
     req.validate()
         .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
 
-    let engine = resolve_engine(&state, &caller, req.language.as_deref()).await?;
+    let (engine, language) = resolve_engine(&state, &caller, req.language.as_deref()).await?;
     let mut by_token: std::collections::HashMap<String, PositionAccumulator> =
         std::collections::HashMap::new();
 
@@ -205,7 +222,10 @@ pub async fn spellcheck_positions(
         })
         .collect();
 
-    Ok(Json(PositionsResponse { results }))
+    Ok((
+        Extension(ResolvedLanguage(language)),
+        Json(PositionsResponse { results }),
+    ))
 }
 
 #[derive(Default)]
@@ -526,6 +546,140 @@ pub async fn reactivate_tenant(
     }
 }
 
+/// Resolves the query window for a `/usage/*` call. Admin callers default to
+/// their own billing period; platform callers to a rolling 30 days, since
+/// "current billing period" has no meaning across many tenants (F59).
+fn usage_window(state: &AppState, scope: &auth::UsageScope, query: &UsageQuery) -> Result<Window> {
+    let period = match scope {
+        auth::UsageScope::Platform => None,
+        auth::UsageScope::Tenant(id) => state
+            .store
+            .get_tenant(id)
+            .and_then(|t| t.period_start.zip(t.period_end)),
+    };
+    usage::resolve_window(query, period)
+}
+
+fn scope_tenant(scope: &auth::UsageScope) -> Option<&str> {
+    match scope {
+        auth::UsageScope::Platform => None,
+        auth::UsageScope::Tenant(id) => Some(id.as_str()),
+    }
+}
+
+/// `GET /usage/daily` (platform key: all tenants; admin key: own tenant).
+pub async fn usage_daily(
+    State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<auth::UsageScope>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<DailyUsageResponse>> {
+    let window = usage_window(&state, &scope, &query)?;
+    let rows = state
+        .store
+        .query_usage_daily(scope_tenant(&scope), &window.start, &window.end)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(DailyUsageResponse {
+        daily_usage: usage::aggregate_daily(&rows),
+    }))
+}
+
+/// `GET /usage/latency`.
+pub async fn usage_latency(
+    State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<auth::UsageScope>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<LatencyResponse>> {
+    let window = usage_window(&state, &scope, &query)?;
+    let rows = state
+        .store
+        .query_usage_latency(scope_tenant(&scope), &window.start, &window.end)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(LatencyResponse {
+        latency_trends: usage::aggregate_latency(&rows, window.dated),
+    }))
+}
+
+/// `GET /usage/errors`.
+pub async fn usage_errors(
+    State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<auth::UsageScope>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<ErrorsResponse>> {
+    let window = usage_window(&state, &scope, &query)?;
+    let rows = state
+        .store
+        .query_usage_daily(scope_tenant(&scope), &window.start, &window.end)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(ErrorsResponse {
+        error_trends: usage::aggregate_errors(&rows, window.dated),
+    }))
+}
+
+/// `GET /usage/languages`.
+pub async fn usage_languages(
+    State(state): State<Arc<AppState>>,
+    Extension(scope): Extension<auth::UsageScope>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<LanguagesResponse>> {
+    let window = usage_window(&state, &scope, &query)?;
+    let rows = state
+        .store
+        .query_usage_daily(scope_tenant(&scope), &window.start, &window.end)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(LanguagesResponse {
+        language_distribution: usage::aggregate_languages(&rows, window.dated),
+    }))
+}
+
+/// Records one billable spellcheck request into the usage rollup (§26.3).
+///
+/// Must stay the **innermost** `route_layer` on the spellcheck group: every
+/// gate above it rejects before reaching here, which is precisely what keeps
+/// the rollup equal to billable requests (F47). Moving it outward silently
+/// starts counting auth and quota rejections.
+pub async fn record_usage(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let tenant_id = request
+        .extensions()
+        .get::<KeyRecord>()
+        .and_then(|k| k.tenant_id.clone())
+        .expect("record_usage runs only on tenant-scoped routes, after require_active_key");
+
+    let start = Instant::now();
+    let response = next.run(request).await;
+    let elapsed = start.elapsed();
+
+    let status = response.status().as_u16();
+    // A response carrying neither extension (a panic mapped upstream, say) is
+    // still recorded rather than dropped — an unattributed row beats a hole.
+    let language = response
+        .extensions()
+        .get::<ResolvedLanguage>()
+        .map(|l| l.0.as_str())
+        .unwrap_or("unknown");
+    let error_slug = if status < 400 {
+        ""
+    } else {
+        response
+            .extensions()
+            .get::<crate::error::ProblemSlug>()
+            .map(|s| s.0)
+            .unwrap_or("internal-error")
+    };
+
+    state
+        .usage
+        .record(&tenant_id, language, status, error_slug, elapsed);
+    response
+}
+
 /// Middleware that increments the global request counter.
 pub async fn request_counter(
     State(state): State<Arc<AppState>>,
@@ -564,6 +718,12 @@ pub fn build_app(state: Arc<AppState>) -> Router {
     let protected_spellcheck = Router::new()
         .route("/spellcheck", post(spellcheck))
         .route("/spellcheck/positions", post(spellcheck_positions))
+        // Added first => innermost => wraps the handler alone, so only
+        // requests that cleared every gate below are recorded (F47, §26.3).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            record_usage,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_quota,
@@ -637,6 +797,24 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             auth::require_active_key,
         ));
 
+    // `/usage/*` admits both `platform` (all tenants) and `admin` (own tenant
+    // only); `require_usage_scope` folds the tenant-active, origin-binding,
+    // and role checks into one layer because neither existing group can
+    // express that split (§26.5).
+    let usage_routes = Router::new()
+        .route("/usage/daily", get(usage_daily))
+        .route("/usage/latency", get(usage_latency))
+        .route("/usage/errors", get(usage_errors))
+        .route("/usage/languages", get(usage_languages))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_usage_scope,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_active_key,
+        ));
+
     // `require_platform_key` subsumes key resolution itself (§23.3), so this
     // group needs no separate `require_active_key` layer.
     let platform_routes = Router::new()
@@ -660,6 +838,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(api_key_routes)
         .merge(tenant_self_get)
         .merge(tenant_origin_routes)
+        .merge(usage_routes)
         .merge(platform_routes)
         .merge(portal)
         .layer(
@@ -724,6 +903,7 @@ world
             Arc::new(config),
             Arc::new(store),
             rate_limiter,
+            Arc::new(UsageRecorder::new()),
         ))
     }
 

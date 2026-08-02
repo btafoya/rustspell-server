@@ -46,6 +46,7 @@ The server is a single Tokio binary with two TCP listeners: the public API on `R
 | `src/swagger.rs` | Swagger UI portal served at `/ui` using `swagger-ui-dist`; `/` redirects there. |
 | `src/store.rs` | Pluggable persistence layer (SQLite or PostgreSQL, §20): keys, tenants, and registered origins, plus in-memory read caches for the auth/CORS hot path. Renamed and broadened from the single-tenant design's `keystore.rs` (§17) — see §20 for why. |
 | `src/auth.rs` | Axum middleware: `X-API-Key` extraction/validation, role gates (`platform`/`admin`/`standard`), origin binding (§23), quota enforcement (§24), and per-IP auth-failure rate limiting. |
+| `src/usage.rs` | Usage rollup recorder (§26): in-memory accumulation buffer, latency bucket ladder, percentile interpolation, and the scope/window resolution shared by the four `/usage/*` handlers. All SQL stays in `store.rs`. |
 | `benches/spellcheck_bench.rs` | Criterion benchmarks for `/spellcheck` throughput. |
 
 ### 2.1 Dependency changes
@@ -358,6 +359,7 @@ A single `AppError` enum covering:
 - `QuotaExceeded` — tenant's `request_count >= quota_limit` → 429, distinct from `RateLimited` (different cause, different remediation: contact billing vs. wait out a cooldown).
 - `RateLimited` — IP is in an auth-failure cooldown → 429, with a `Retry-After` header set to the remaining cooldown seconds.
 - `NotFound` — unknown `id`, or an `id` that exists but belongs to a different tenant (never leak cross-tenant existence via a 403 instead of 404) → 404.
+- `InvalidDateRange` — malformed, inverted, half-supplied, or over-retention `start`/`end` on a `/usage/*` query (§26.6) → 400.
 
 Each variant implements `IntoResponse` producing:
 
@@ -516,6 +518,7 @@ Use `tower::ServiceExt::oneshot` for integration tests to avoid binding real por
 6. **Multi-Tenancy**: add `tenants`/`tenant_origins` tables and `sqlx::any` Postgres support to `store.rs` (§20–21); add `platform` role, tenant handlers, dynamic CORS predicate, origin binding, and quota middleware (§22–24); extend `engine.rs` with `EngineRegistry` (§25) and thread `language` through `SpellCheckRequest`; update `openapi.json` with `/tenants*`, `/tenant*` paths.
 7. **Tests + Benchmarks**: unit tests, integration tests, `benches/spellcheck_bench.rs`.
 8. **Deployment**: Dockerfile, docker-compose.yml, README updates.
+9. **Usage Rollup** (§26): add `usage_daily`/`usage_latency` tables and flush/query/purge methods to `store.rs`; create `usage.rs` (buffer, bucket ladder, percentiles); add the `record_usage` and `require_usage_scope` middleware and the four `/usage/*` handlers; add `AppError::InvalidDateRange` plus its `docs/errors/` page; spawn flush and purge tasks in `main.rs` and flush on shutdown; update `openapi.json`.
 
 ## 16. Risks and Notes
 
@@ -531,6 +534,9 @@ Use `tower::ServiceExt::oneshot` for integration tests to avoid binding real por
 - **SQLite concurrency**: `sqlx::SqlitePool` (via `sqlx::any`) with `PRAGMA journal_mode=WAL` set on connection. SQLite still serializes writers regardless of pool size, and all hot-path reads go through the in-memory cache, so the pool mainly buys the same async interface Postgres uses — not extra write throughput.
 - **Quota counter durability**: like `last_used_at`, `request_count` is incremented in-memory (source of truth for the hot-path 429 decision) and flushed to the store fire-and-forget. A crash between increment and flush undercounts usage from the billing app's view (a little free quota, never over-counting into a false 429). // ponytail: fire-and-forget per request; batch/debounce if profiling shows write pressure, same ceiling as `last_used_at`.
 - **Cross-tenant ID enumeration**: `/api-keys/{id}`, `/tenant/origins/{id}`, and `/tenants/{id}` must all return 404 (not 403) for IDs that exist but belong to a different tenant/scope — otherwise the response code itself leaks that an ID exists, allowing enumeration.
+- **Usage rollup row growth**: bounded by F51/F52 — roughly 180k rows in `usage_daily` plus ~100k in `usage_latency` at 100 tenants × 5 languages × 90 days. Single-digit MB. The real cardinality risk is `language`: a tenant sending many per-request `language` overrides (F44) multiplies its row count. Bounded in practice because the value must name a loadable dictionary, but worth watching if the supported-language list grows large.
+- **Usage recording layer position**: `record_usage` must stay the innermost `.route_layer()` on `protected_spellcheck`. Moving it outward silently starts recording auth/quota rejections, which breaks the "rollup counts equal billable requests" invariant that `REQUIREMENTS.md` §6 depends on. §26.10's 429-records-nothing test is the guard.
+- **Flush interval vs. durability**: up to 10 seconds of usage data is lost on an unclean kill. Consistent with F49 and the existing quota-counter tradeoff, and the graceful-shutdown path flushes explicitly so a normal deploy loses nothing. Only an actual crash or `SIGKILL` costs data.
 - **`tenant_quota_usage_ratio{tenant_id=...}` cardinality**: one Prometheus series per tenant. Fine for tens–hundreds of tenants; revisit (aggregate instead, or drop the per-tenant label) if the tenant count grows into the thousands.
 - **Cold-language latency**: the first `/spellcheck*` request for a language not yet cached in `EngineRegistry` pays a full download+parse (potentially seconds), unlike the sub-5ms p50 target for already-loaded languages. This is a one-time cost per language per process lifetime, not per-request, but is a real latency spike for whichever request happens to trigger it.
 - **Storage backend parity risk**: `sqlx::any` gives one query surface, but SQLite and Postgres still differ in transaction/locking semantics under concurrent writes. The schema (§21.1) deliberately avoids backend-specific types (`BIGINT`/`TEXT` only, no `SERIAL`/`AUTOINCREMENT`) to minimize drift, but integration tests should run against both backends before this ships (see §14).
@@ -962,3 +968,201 @@ impl EngineRegistry {
 `std::sync::RwLock` held across an `.await` inside `get_or_load` is a real bug to avoid at implementation time (blocks the executor) — the write lock must be released before the `await` on `ensure_dictionary_for`, re-acquired after, with a re-check (as sketched) to handle the race where two requests both miss the cache for the same new language simultaneously. `DictionaryManager::ensure_dictionary_for(language)` is `dictionary.rs`'s existing `ensure_dictionary` (§5.1), parameterized instead of reading `config.language` directly.
 
 `spellcheck`/`spellcheck_positions` handlers resolve the engine via `state.engines.get_or_load(req.language.as_deref().unwrap_or(&tenant.language)).await?`, mapping `EngineError` to a 400 Problem Details response (not the 500/fail-fast treatment reserved for the startup-time default language, per §5.3).
+
+## 26. Usage Rollup & `/usage/*` Endpoints
+
+Implements §3.10 (F47–F64). Existing observability (§11) cannot serve this: the Prometheus registry is in-process and resets on restart, and F45's `request_count` is a single running integer with no time dimension.
+
+### 26.1 Storage
+
+Two tables, not one. The full cross-product (day × tenant × language × status × slug × latency bucket) would multiply row count by the bucket ladder for no benefit — no endpoint needs latency split by language *and* status. Splitting keeps each query scanning only its own dimensions and keeps NF13 honest.
+
+```sql
+CREATE TABLE IF NOT EXISTS usage_daily (
+    day            TEXT    NOT NULL,          -- 'YYYY-MM-DD', UTC
+    tenant_id      TEXT    NOT NULL REFERENCES tenants(id),
+    language       TEXT    NOT NULL,
+    status         BIGINT  NOT NULL,          -- HTTP status
+    error_slug     TEXT    NOT NULL,          -- AppError slug; '' for 2xx (F53: no NULLs)
+    request_count  BIGINT  NOT NULL,
+    latency_sum_us BIGINT  NOT NULL,          -- exact average; buckets alone only approximate
+    PRIMARY KEY (day, tenant_id, language, status, error_slug)
+);
+
+CREATE TABLE IF NOT EXISTS usage_latency (
+    day           TEXT    NOT NULL,
+    tenant_id     TEXT    NOT NULL REFERENCES tenants(id),
+    bucket_le_ms  BIGINT  NOT NULL,           -- inclusive upper bound; -1 == +Inf overflow
+    request_count BIGINT  NOT NULL,
+    PRIMARY KEY (day, tenant_id, bucket_le_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day);
+CREATE INDEX IF NOT EXISTS idx_usage_latency_day ON usage_latency(day);
+```
+
+Every column is `NOT NULL`, so none of them hit the `sqlx::Any` NULL-decode defect documented above `key_record_from_row` — no `COALESCE` sentinels needed here. `error_slug = ''` rather than NULL is what buys that on the one column that would naturally be nullable.
+
+`bucket_le_ms` stores the **boundary in milliseconds, not the ladder index**. Same width, but a future ladder change leaves already-stored rows meaning exactly what they meant when written; storing an index would silently remap 90 days of history.
+
+### 26.2 Latency bucket ladder
+
+```rust
+/// Inclusive upper bounds in ms. Dense at the low end because NF01 targets
+/// p50 < 5 ms — a coarser ladder there would put p50 and p95 in the same bucket.
+const LATENCY_BUCKETS_MS: [u64; 10] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000];
+const BUCKET_OVERFLOW: i64 = -1; // anything above 1000 ms
+```
+
+Percentiles use the standard cumulative-count walk with linear interpolation inside the bucket that crosses the target rank. If the rank falls in the overflow bucket, report the last finite boundary (`1000`) rather than extrapolating into an unbounded range — the same thing Prometheus' `histogram_quantile` does, and the only honest answer.
+
+Accuracy is ±half a bucket width, accepted in `REQUIREMENTS.md` §6. Buckets are `const`, not configurable: a knob that invalidates comparison against every stored row is a trap, not a feature.
+
+### 26.3 Recording path
+
+Recording must see only requests that passed every gate (F47), and must observe the response status, the resolved language, and the error slug. That fixes its position in the layer stack — **innermost**, wrapping the handler alone:
+
+```
+outermost / runs first
+  metrics_middleware            (§11, all routes)
+  request_counter
+  TraceLayer / CORS / request-id
+  require_active_key            ─┐
+  require_active_tenant          │ added last → outermost of the group
+  require_origin_binding         │
+  require_quota                  │
+  record_usage                  ─┘ added FIRST → innermost, wraps handler only
+      spellcheck / spellcheck_positions
+```
+
+Per the `build_app` convention, `record_usage` is the **first** `.route_layer()` added to `protected_spellcheck`, making it the last to run before the handler. A request rejected by any gate above never reaches it, so rejections are never recorded — exactly F47.
+
+The two facts the middleware cannot read off the wire travel back on response extensions:
+
+- `resolve_engine` inserts `ResolvedLanguage(String)` after it resolves the override-or-tenant-default language.
+- `AppError::into_response` inserts `ProblemSlug(&'static str)`, reusing the existing `problem_type` slug so error identifiers can never drift from the RFC 7807 `type` URIs.
+
+A response carrying neither (a panic caught upstream, say) records `language = "unknown"`, `error_slug = "internal-error"` rather than dropping the row.
+
+Doing this in middleware rather than at the end of each handler is deliberate: the handlers have multiple `?` early-return paths, and a call site per path would miss exactly the error cases `/usage/errors` exists to report.
+
+### 26.4 Buffering and flush
+
+Writing a row per request would put a serialized SQLite `UPSERT` on the hot path — the ceiling §16 already flags for `last_used_at` and `request_count`, but worse, because this write is an aggregate read-modify-write. So `UsageRecorder` accumulates in memory and a background task flushes:
+
+```rust
+pub struct UsageRecorder {
+    daily:   Mutex<HashMap<DailyKey, DailyCounters>>,   // day, tenant, language, status, slug
+    latency: Mutex<HashMap<LatencyKey, u64>>,           // day, tenant, bucket_le_ms
+}
+
+impl UsageRecorder {
+    /// Called from `record_usage` middleware. Lock-and-increment only — no I/O,
+    /// no await, so it cannot fail or slow the request (F49).
+    pub fn record(&self, tenant_id: &str, language: &str, status: u16, slug: &str, latency: Duration);
+
+    /// Drains both buffers and hands them to `Store::flush_usage`. Called every
+    /// FLUSH_INTERVAL and once during graceful shutdown (§12).
+    pub async fn flush(&self, store: &Store);
+}
+
+const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+```
+
+`Store::flush_usage` applies each drained entry as one `INSERT … ON CONFLICT (…) DO UPDATE SET request_count = request_count + excluded.request_count, …`, inside a single transaction. That upsert form is identical on SQLite and PostgreSQL, satisfying NF14 without a backend branch.
+
+A crash loses at most one flush interval, which undercounts — never over-counts — exactly the tradeoff F49 permits and the same one already accepted for the quota counter.
+
+`FLUSH_INTERVAL` is a `const`, not config. // ponytail: 10s fixed; make it configurable only if a deployment actually needs a different durability/write-volume point.
+
+### 26.5 Authorization and scope
+
+The existing layer groups can't express this one: F60 admits both `platform` (no tenant) and `admin` (tenant-scoped), while `require_active_tenant` assumes a tenant exists and `require_platform_key` excludes admins. One new middleware composes the existing checks rather than reimplementing them:
+
+```rust
+pub enum UsageScope { Platform, Tenant(String) }
+
+/// Layered after `require_active_key` on the `/usage/*` group.
+pub async fn require_usage_scope(...) -> Response;
+```
+
+| Caller role | Outcome |
+|---|---|
+| `standard` | 403 `Forbidden` (F60), consistent with F30's role-gate behaviour |
+| `platform` | `Origin` header present → 403, per F43a's server-to-server rule; otherwise `UsageScope::Platform` |
+| `admin` | Tenant must exist and not be suspended, and origin binding (§23.2) applies; then `UsageScope::Tenant(id)` |
+
+Handlers read `UsageScope` from request extensions. `Platform` applies no tenant filter; `Tenant(id)` adds `WHERE tenant_id = ?` to every query. Because F57's percentage denominator is computed by the same filtered `SUM`, F61 holds structurally — there is no code path that could divide a tenant's count by a platform-wide total.
+
+### 26.6 Window resolution
+
+```rust
+/// Returns an inclusive UTC date range.
+fn resolve_window(scope: &UsageScope, start: Option<&str>, end: Option<&str>, store: &Store)
+    -> Result<(NaiveDate, NaiveDate)>;
+```
+
+- Both params supplied → use them. `start > end`, an unparseable date, or a range wider than the 90-day retention window → `AppError::InvalidDateRange` (new variant, 400, slug `invalid-date-range`, with the `docs/errors/invalid-date-range.md` page the CLAUDE.md rule requires).
+- Omitted, `UsageScope::Tenant` → the tenant's `period_start`/`period_end` (F59). If either is unset (the `-1` sentinel), fall back to the last 30 days rather than erroring — an un-provisioned tenant should still see its data.
+- Omitted, `UsageScope::Platform` → last 30 days (F59).
+
+Supplying only one of the two is a 400: a half-open window would silently mean different things per scope.
+
+### 26.7 Endpoint contracts
+
+All four are `GET`, take optional `start`/`end`, and are added as one `usage_routes` group in `build_app`. `date` is present per row when `start`/`end` were supplied and omitted otherwise (`skip_serializing_if = "Option::is_none"`), so one struct serves both F58 modes.
+
+**`GET /usage/daily`** — always dated; a "daily" endpoint returning one undated aggregate would be nonsense. This narrows F58 for this endpoint only.
+
+```json
+{"daily_usage":[{"date":"2026-07-31","requests":100,"average_latency_ms":42,"errors":2}]}
+```
+
+`average_latency_ms` = `latency_sum_us / request_count / 1000`, exact rather than bucket-derived. `errors` counts rows with `status >= 400`.
+
+**`GET /usage/latency`**
+
+```json
+{"latency_trends":[{"percentile":"p50","value_ms":30},{"percentile":"p95","value_ms":80},{"percentile":"p99","value_ms":150}]}
+```
+
+Interpolated per §26.2. With `start`/`end`, each row also carries `date` and percentiles are computed per day — buckets are additive, so a multi-day aggregate is a valid histogram, not an average of averages.
+
+**`GET /usage/errors`** — both dimensions per F56.
+
+```json
+{"error_trends":[{"status":400,"error_code":"validation-error","count":12}]}
+```
+
+`error_code` is the `AppError` slug, identical to the tail of the RFC 7807 `type` URI, so a dashboard can link straight to `docs/errors/{slug}.md`.
+
+**`GET /usage/languages`**
+
+```json
+{"language_distribution":[{"language":"en_US","count":800,"percentage":80.0}]}
+```
+
+`percentage` is rounded to one decimal and computed against the scope-filtered total (F61). An empty window returns `[]` with the percentage question moot — never a division by zero.
+
+Requests that failed before `resolve_engine` ran (validation, malformed JSON) are attributed to the language `unknown`, since no language was ever resolved for them. That bucket is small by construction — it can only contain handler-level errors — and reporting it beats either dropping those requests from the rollup or guessing a language they never had.
+
+All four return `200` with an empty array before any data accumulates (US22); an empty result is not a 404.
+
+### 26.8 Retention
+
+A second background task, on a 24-hour interval and once at startup, deletes from both tables where `day < today - 90` (F51). Two `DELETE`s in one transaction. Startup execution matters because a server that is down for a week would otherwise carry stale rows until its first interval fires.
+
+### 26.9 `AppState` and wiring
+
+`AppState` gains `usage: Arc<UsageRecorder>`, alongside the existing `engines`/`config`/`store`/`rate_limiter`. `main.rs` spawns the flush and purge tasks after `Store::open`, and the graceful-shutdown path (§12) awaits a final `flush` before the process exits so the last partial interval isn't lost on a clean deploy.
+
+### 26.10 Testing
+
+- **Bucket maths** — unit tests for percentile interpolation: known bucket counts → known p50/p95/p99, plus the overflow-bucket clamp and the empty-histogram case.
+- **Persistence** — a file-backed `Store::open` → record → flush → close → reopen → query test, per the CLAUDE.md rule. `:memory:` never exercises the reload path.
+- **Upsert accumulation** — flushing twice for the same key must add, not overwrite. This is the bug the `ON CONFLICT` clause exists to prevent, so it needs its own test.
+- **Scope isolation** — integration test with two tenants: an admin key sees only its own counts, including in the `percentage` denominator (F61).
+- **Role gate** — `standard` key → 403; `platform` key with an `Origin` header → 403.
+- **Window resolution** — inverted range → 400; single param → 400; tenant with unset billing period → 30-day fallback, not an error.
+- **Recording scope** — a quota-rejected (429) request records nothing, proving the layer ordering in §26.3 is correct. This is the single test most likely to catch a future refactor that moves `record_usage` outward.
+- **OpenAPI** — all four paths present, spec-validation test passing (F63).

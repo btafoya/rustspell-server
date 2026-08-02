@@ -12,3 +12,4 @@ pub mod models;
 pub mod openapi;
 pub mod store;
 pub mod swagger;
+pub mod usage;

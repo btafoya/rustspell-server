@@ -99,6 +99,39 @@ billing backend), never a browser.
 | PATCH | `/tenants/{id}` | platform | Update quota, billing period, name, language |
 | POST | `/tenants/{id}/suspend` | platform | Suspend a tenant (blocks all its keys) |
 | POST | `/tenants/{id}/reactivate` | platform | Reactivate a suspended tenant |
+| GET | `/usage/daily` | platform/admin | Per-day requests, average latency, errors |
+| GET | `/usage/latency` | platform/admin | p50/p95/p99 latency |
+| GET | `/usage/errors` | platform/admin | Counts by HTTP status and error slug |
+| GET | `/usage/languages` | platform/admin | Requests and share of total per language |
+
+### Usage metrics
+
+The four `/usage/*` endpoints read a rollup written on every billable
+`/spellcheck*` request and retained for 90 days. A `platform` key sees every
+tenant; an `admin` key sees only its own.
+
+All four accept an optional `start`/`end` window (`YYYY-MM-DD`, both or
+neither). With a window, rows carry a `date` so the data plots as a trend;
+without one, they return a single aggregate over the caller's current billing
+period (admin) or the last 30 days (platform). `/usage/daily` is always dated.
+
+```bash
+curl -H "X-API-Key: $KEY" localhost:3000/usage/latency
+curl -H "X-API-Key: $KEY" "localhost:3000/usage/daily?start=2026-07-01&end=2026-07-31"
+```
+
+Two things to know when reading the numbers:
+
+- Only requests that reach a spellcheck handler are counted, so the totals
+  match billable usage exactly — but `/usage/errors` never shows `401`, `403`,
+  or `429`, since those are rejected by middleware first. It covers validation,
+  malformed-JSON, and internal errors only. Use the Prometheus endpoint on
+  `:9090` for rejection rates.
+- Requests that fail before the language is resolved are attributed to the
+  language `unknown` in `/usage/languages`.
+
+Percentiles are interpolated from fixed histogram buckets, so they are accurate
+to about half a bucket width rather than exact.
 
 All authenticated endpoints take the key via the `X-API-Key` header. Open a browser to
 `/` after starting the server for interactive documentation, or fetch the raw spec from

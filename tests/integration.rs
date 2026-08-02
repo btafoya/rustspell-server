@@ -14,6 +14,7 @@ use rustspell_server::{
     engine::{Engine, EngineRegistry},
     handlers::{self, AppState},
     store::{Role, Store},
+    usage::UsageRecorder,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -21,6 +22,13 @@ use tower::ServiceExt;
 /// Returns the app, the store (for minting keys/tenants/origins directly),
 /// and the bootstrap platform key.
 async fn test_app() -> (Router, Arc<Store>, String) {
+    let (app, store, _usage, platform_key) = test_app_with_usage().await;
+    (app, store, platform_key)
+}
+
+/// Like [`test_app`], but also hands back the usage recorder so tests can
+/// assert on what the `record_usage` middleware buffered.
+async fn test_app_with_usage() -> (Router, Arc<Store>, Arc<UsageRecorder>, String) {
     let aff = r"SET UTF-8
 TRY abc
 ";
@@ -59,13 +67,15 @@ world
         Duration::from_secs(config.auth_rate_limit_window_seconds),
         Duration::from_secs(config.auth_rate_limit_cooldown_seconds),
     ));
+    let usage = Arc::new(UsageRecorder::new());
     let state = Arc::new(AppState::new(
         engines,
         Arc::new(config),
         store.clone(),
         rate_limiter,
+        usage.clone(),
     ));
-    (handlers::build_app(state), store, platform_key)
+    (handlers::build_app(state), store, usage, platform_key)
 }
 
 /// Creates a fresh tenant and returns a raw `standard`-role key for it.
@@ -144,6 +154,7 @@ world
         Arc::new(config),
         store.clone(),
         rate_limiter,
+        Arc::new(UsageRecorder::new()),
     ));
     (handlers::build_app(state), store, platform_key)
 }
@@ -947,6 +958,10 @@ async fn openapi_spec_covers_all_public_paths() {
         "/tenants/{id}",
         "/tenants/{id}/suspend",
         "/tenants/{id}/reactivate",
+        "/usage/daily",
+        "/usage/latency",
+        "/usage/errors",
+        "/usage/languages",
     ] {
         assert!(
             paths.contains_key(route),
@@ -995,6 +1010,30 @@ async fn openapi_operations_declare_runtime_status_codes() {
             &["200", "401", "403", "404"],
         ),
         ("/tenant", "get", "getOwnTenant", &["200", "401", "403"]),
+        (
+            "/usage/daily",
+            "get",
+            "getUsageDaily",
+            &["200", "400", "401", "403"],
+        ),
+        (
+            "/usage/latency",
+            "get",
+            "getUsageLatency",
+            &["200", "400", "401", "403"],
+        ),
+        (
+            "/usage/errors",
+            "get",
+            "getUsageErrors",
+            &["200", "400", "401", "403"],
+        ),
+        (
+            "/usage/languages",
+            "get",
+            "getUsageLanguages",
+            &["200", "400", "401", "403"],
+        ),
         (
             "/tenant/origins",
             "get",
@@ -1548,4 +1587,271 @@ async fn unknown_tenant_id_returns_not_found_on_every_platform_route() {
             "{method} {uri} should 404 for an unknown tenant id"
         );
     }
+}
+
+// ---- Usage rollup (DESIGN.md §26) --------------------------------------
+
+/// Fires one `/spellcheck` request and returns its status.
+async fn spellcheck_once(app: &Router, key: &str, body: serde_json::Value) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/spellcheck")
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn get_json(app: &Router, uri: &str, key: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+#[tokio::test]
+async fn successful_spellcheck_is_recorded_with_its_resolved_language() {
+    let (app, store, usage, _platform_key) = test_app_with_usage().await;
+    let (_tenant_id, admin_key) = mint_admin_key(&store).await;
+
+    assert_eq!(
+        spellcheck_once(&app, &admin_key, json!({ "text": "hello" })).await,
+        StatusCode::OK
+    );
+
+    let (daily, latency) = usage.drain();
+    assert_eq!(daily.len(), 1);
+    assert_eq!(daily[0].0.status, 200);
+    assert_eq!(daily[0].0.error_slug, "");
+    assert_eq!(
+        daily[0].0.language, "en_US",
+        "the resolved language must ride back on the response, not be re-derived"
+    );
+    assert_eq!(daily[0].1.request_count, 1);
+    assert_eq!(latency.iter().map(|(_, c)| *c).sum::<i64>(), 1);
+}
+
+#[tokio::test]
+async fn handler_errors_are_recorded_with_their_problem_slug() {
+    let (app, store, usage, _platform_key) = test_app_with_usage().await;
+    let (_tenant_id, admin_key) = mint_admin_key(&store).await;
+
+    // Neither `text` nor `words` -> validation error inside the handler.
+    assert_eq!(
+        spellcheck_once(&app, &admin_key, json!({})).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    let (daily, _latency) = usage.drain();
+    assert_eq!(daily.len(), 1);
+    assert_eq!(daily[0].0.status, 400);
+    assert_eq!(daily[0].0.error_slug, "validation-error");
+}
+
+/// The layer-ordering guard: `record_usage` is the innermost route layer, so
+/// anything rejected by a gate above it never enters the rollup. If this ever
+/// fails, the "rollup counts equal billable requests" invariant is broken.
+#[tokio::test]
+async fn requests_rejected_before_the_handler_are_never_recorded() {
+    let (app, store, usage, _platform_key) = test_app_with_usage().await;
+
+    // Quota-exhausted tenant: rejected by `require_quota`.
+    let (tenant, quota_admin) = store
+        .create_tenant("Quota Tenant".to_string(), None, Some(1), None, None)
+        .await
+        .unwrap();
+    store
+        .update_tenant(&tenant.id, None, None, None, Some(5), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        spellcheck_once(&app, &quota_admin.raw_key, json!({ "text": "hello" })).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Suspended tenant: rejected by `require_active_tenant`.
+    let (suspended_id, suspended_key) = mint_admin_key(&store).await;
+    store.set_suspended(&suspended_id, true).await.unwrap();
+    assert_eq!(
+        spellcheck_once(&app, &suspended_key, json!({ "text": "hello" })).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // Unknown key: rejected by `require_active_key`.
+    assert_eq!(
+        spellcheck_once(&app, "not-a-real-key", json!({ "text": "hello" })).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let (daily, latency) = usage.drain();
+    assert!(
+        daily.is_empty() && latency.is_empty(),
+        "rejected requests must not be recorded, got {daily:?}"
+    );
+}
+
+#[tokio::test]
+async fn usage_endpoints_reject_standard_keys_and_origin_bearing_platform_keys() {
+    let (app, store, platform_key) = test_app().await;
+    let standard_key = mint_standard_key(&store).await;
+
+    for path in [
+        "/usage/daily",
+        "/usage/latency",
+        "/usage/errors",
+        "/usage/languages",
+    ] {
+        let (status, _) = get_json(&app, path, &standard_key).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path} with a standard key");
+    }
+
+    // F43a: a platform key is server-to-server only.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/usage/daily")
+                .header("x-api-key", &platform_key)
+                .header("origin", "https://dashboard.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn usage_endpoints_return_empty_arrays_before_any_data_accumulates() {
+    let (app, _store, platform_key) = test_app().await;
+
+    let (status, body) = get_json(&app, "/usage/daily", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["daily_usage"].as_array().unwrap().len(), 0);
+
+    let (status, body) = get_json(&app, "/usage/languages", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["language_distribution"].as_array().unwrap().len(), 0);
+
+    let (status, body) = get_json(&app, "/usage/latency", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["latency_trends"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn usage_rejects_malformed_inverted_and_half_supplied_windows() {
+    let (app, _store, platform_key) = test_app().await;
+
+    for query in [
+        "?start=2026-07-31&end=2026-07-01",
+        "?start=2026-07-01",
+        "?end=2026-07-01",
+        "?start=2026-02-30&end=2026-03-01",
+        "?start=2020-01-01&end=2026-01-01",
+    ] {
+        let (status, _) = get_json(&app, &format!("/usage/daily{query}"), &platform_key).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "window {query}");
+    }
+}
+
+/// F61: an admin key must never see another tenant's traffic, including in
+/// the percentage denominator.
+#[tokio::test]
+async fn admin_scope_isolates_usage_from_other_tenants() {
+    let (app, store, usage, platform_key) = test_app_with_usage().await;
+    let (_tenant_a, admin_a) = mint_admin_key(&store).await;
+    let (_tenant_b, admin_b) = mint_admin_key(&store).await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            spellcheck_once(&app, &admin_a, json!({ "text": "hello" })).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        spellcheck_once(&app, &admin_b, json!({ "text": "hello" })).await,
+        StatusCode::OK
+    );
+
+    let (daily, latency) = usage.drain();
+    store.flush_usage(daily, latency).await.unwrap();
+
+    let (status, body) = get_json(&app, "/usage/languages", &admin_a).await;
+    assert_eq!(status, StatusCode::OK);
+    let dist = body["language_distribution"].as_array().unwrap();
+    assert_eq!(dist.len(), 1);
+    assert_eq!(dist[0]["count"], 3, "tenant A sees only its own requests");
+    assert_eq!(
+        dist[0]["percentage"], 100.0,
+        "the denominator must be tenant A's total, not the platform's"
+    );
+
+    // The platform key sees both tenants combined.
+    let (status, body) = get_json(&app, "/usage/languages", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    let dist = body["language_distribution"].as_array().unwrap();
+    assert_eq!(dist[0]["count"], 4);
+}
+
+#[tokio::test]
+async fn usage_daily_and_errors_render_recorded_traffic() {
+    let (app, store, usage, platform_key) = test_app_with_usage().await;
+    let (_tenant_id, admin_key) = mint_admin_key(&store).await;
+
+    assert_eq!(
+        spellcheck_once(&app, &admin_key, json!({ "text": "hello" })).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        spellcheck_once(&app, &admin_key, json!({})).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    let (daily, latency) = usage.drain();
+    store.flush_usage(daily, latency).await.unwrap();
+
+    let (status, body) = get_json(&app, "/usage/daily", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    let days = body["daily_usage"].as_array().unwrap();
+    assert_eq!(days.len(), 1);
+    assert_eq!(days[0]["requests"], 2);
+    assert_eq!(days[0]["errors"], 1);
+    assert!(days[0]["date"].is_string(), "daily rows are always dated");
+
+    let (status, body) = get_json(&app, "/usage/errors", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    let errors = body["error_trends"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["status"], 400);
+    assert_eq!(errors[0]["error_code"], "validation-error");
+    assert_eq!(errors[0]["count"], 1);
+    assert!(
+        errors[0].get("date").is_none(),
+        "no explicit window -> flat shape"
+    );
+
+    let (status, body) = get_json(&app, "/usage/latency", &platform_key).await;
+    assert_eq!(status, StatusCode::OK);
+    let trends = body["latency_trends"].as_array().unwrap();
+    assert_eq!(trends.len(), 3, "p50/p95/p99");
+    assert_eq!(trends[0]["percentile"], "p50");
 }

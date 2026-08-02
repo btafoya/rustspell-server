@@ -14,6 +14,7 @@ use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::usage::{DailyCounters, DailyKey, LatencyKey, UsageDailyRow, UsageLatencyRow};
 
 /// A key's role. `Platform` keys manage tenants and have no `tenant_id`;
 /// `Admin`/`Standard` keys always belong to exactly one tenant.
@@ -666,6 +667,168 @@ impl Store {
             .map(|map| map.contains_key(origin))
             .unwrap_or(false)
     }
+
+    // ---- Usage rollup (§26) --------------------------------------------
+
+    /// Applies a drained [`UsageRecorder`](crate::usage::UsageRecorder) batch.
+    /// The `ON CONFLICT … DO UPDATE` form accumulates rather than overwrites,
+    /// which is what makes repeated flushes for the same day additive, and is
+    /// spelled identically on SQLite and PostgreSQL (NF14).
+    pub async fn flush_usage(
+        &self,
+        daily: Vec<(DailyKey, DailyCounters)>,
+        latency: Vec<(LatencyKey, i64)>,
+    ) -> anyhow::Result<()> {
+        if daily.is_empty() && latency.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for (key, counters) in daily {
+            sqlx::query(
+                "INSERT INTO usage_daily (day, tenant_id, language, status, error_slug, request_count, latency_sum_us) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (day, tenant_id, language, status, error_slug) DO UPDATE SET \
+                 request_count = usage_daily.request_count + excluded.request_count, \
+                 latency_sum_us = usage_daily.latency_sum_us + excluded.latency_sum_us",
+            )
+            .bind(&key.day)
+            .bind(&key.tenant_id)
+            .bind(&key.language)
+            .bind(key.status)
+            .bind(&key.error_slug)
+            .bind(counters.request_count)
+            .bind(counters.latency_sum_us)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for (key, count) in latency {
+            sqlx::query(
+                "INSERT INTO usage_latency (day, tenant_id, bucket_le_ms, request_count) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (day, tenant_id, bucket_le_ms) DO UPDATE SET \
+                 request_count = usage_latency.request_count + excluded.request_count",
+            )
+            .bind(&key.day)
+            .bind(&key.tenant_id)
+            .bind(key.bucket_le_ms)
+            .bind(count)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// `tenant_id = None` is platform scope (no filter); `Some(id)` restricts
+    /// to one tenant, which is what makes F61 structural — the percentage
+    /// denominator is computed from whatever this returns.
+    ///
+    /// `SUM` is cast to `BIGINT` because PostgreSQL returns `NUMERIC` for
+    /// `SUM(bigint)`, which `sqlx::Any` cannot decode as `i64`.
+    pub async fn query_usage_daily(
+        &self,
+        tenant_id: Option<&str>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<UsageDailyRow>> {
+        let sql = "SELECT day, language, status, error_slug, \
+                   CAST(SUM(request_count) AS BIGINT) AS request_count, \
+                   CAST(SUM(latency_sum_us) AS BIGINT) AS latency_sum_us \
+                   FROM usage_daily WHERE day >= ? AND day <= ?";
+        let rows = match tenant_id {
+            Some(id) => {
+                sqlx::query(&format!(
+                    "{sql} AND tenant_id = ? GROUP BY day, language, status, error_slug"
+                ))
+                .bind(start)
+                .bind(end)
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!("{sql} GROUP BY day, language, status, error_slug"))
+                    .bind(start)
+                    .bind(end)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+
+        rows.iter()
+            .map(|row| {
+                Ok(UsageDailyRow {
+                    day: row.try_get("day")?,
+                    language: row.try_get("language")?,
+                    status: row.try_get("status")?,
+                    error_slug: row.try_get("error_slug")?,
+                    request_count: row.try_get("request_count")?,
+                    latency_sum_us: row.try_get("latency_sum_us")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn query_usage_latency(
+        &self,
+        tenant_id: Option<&str>,
+        start: &str,
+        end: &str,
+    ) -> anyhow::Result<Vec<UsageLatencyRow>> {
+        let sql = "SELECT day, bucket_le_ms, \
+                   CAST(SUM(request_count) AS BIGINT) AS request_count \
+                   FROM usage_latency WHERE day >= ? AND day <= ?";
+        let rows = match tenant_id {
+            Some(id) => {
+                sqlx::query(&format!(
+                    "{sql} AND tenant_id = ? GROUP BY day, bucket_le_ms"
+                ))
+                .bind(start)
+                .bind(end)
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(&format!("{sql} GROUP BY day, bucket_le_ms"))
+                    .bind(start)
+                    .bind(end)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+
+        rows.iter()
+            .map(|row| {
+                Ok(UsageLatencyRow {
+                    day: row.try_get("day")?,
+                    bucket_le_ms: row.try_get("bucket_le_ms")?,
+                    request_count: row.try_get("request_count")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Drops rollup rows strictly older than `cutoff_day` (F51).
+    pub async fn purge_usage_before(&self, cutoff_day: &str) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let daily = sqlx::query("DELETE FROM usage_daily WHERE day < ?")
+            .bind(cutoff_day)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let latency = sqlx::query("DELETE FROM usage_latency WHERE day < ?")
+            .bind(cutoff_day)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(daily + latency)
+    }
 }
 
 async fn init_schema(pool: &AnyPool) -> anyhow::Result<()> {
@@ -723,6 +886,46 @@ async fn init_schema(pool: &AnyPool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash)")
+        .execute(pool)
+        .await?;
+
+    // Usage rollup (§26.1). Two tables rather than one: the full cross-product
+    // would multiply row count by the latency ladder for no benefit, since no
+    // endpoint needs latency split by both language and status. Every column
+    // is NOT NULL, so none of them hit the `sqlx::Any` NULL-decode defect
+    // documented below — `error_slug = ''` is what buys that on the one column
+    // that would otherwise be nullable.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS usage_daily (
+            day            TEXT   NOT NULL,
+            tenant_id      TEXT   NOT NULL,
+            language       TEXT   NOT NULL,
+            status         BIGINT NOT NULL,
+            error_slug     TEXT   NOT NULL,
+            request_count  BIGINT NOT NULL,
+            latency_sum_us BIGINT NOT NULL,
+            PRIMARY KEY (day, tenant_id, language, status, error_slug)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS usage_latency (
+            day           TEXT   NOT NULL,
+            tenant_id     TEXT   NOT NULL,
+            bucket_le_ms  BIGINT NOT NULL,
+            request_count BIGINT NOT NULL,
+            PRIMARY KEY (day, tenant_id, bucket_le_ms)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_daily_day ON usage_daily(day)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_latency_day ON usage_latency(day)")
         .execute(pool)
         .await?;
 
@@ -987,6 +1190,216 @@ mod tests {
         );
         assert!(store.get_tenant(&tenant_id).is_some());
         assert!(store.authenticate(&raw_key).is_some());
+    }
+
+    /// Usage rows must survive a real restart, not just live in the cache —
+    /// `:memory:` never exercises the reload-from-disk path.
+    #[tokio::test]
+    async fn reopen_file_backed_store_preserves_usage_rollup() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            port: 3000,
+            metrics_port: 9090,
+            log_level: "info".to_string(),
+            language: "en_US".to_string(),
+            dictionary_url: "https://example.com".to_string(),
+            dictionary_dir: dir.path().to_path_buf(),
+            refresh_interval_hours: 24,
+            db_path: dir.path().join("usage.db"),
+            db_url: None,
+            auth_rate_limit_max: 10,
+            auth_rate_limit_window_seconds: 60,
+            auth_rate_limit_cooldown_seconds: 60,
+        };
+
+        {
+            let (store, _bootstrap) = Store::open(&config).await.unwrap();
+            store
+                .flush_usage(
+                    vec![(
+                        DailyKey {
+                            day: "2026-07-30".to_string(),
+                            tenant_id: "t1".to_string(),
+                            language: "en_US".to_string(),
+                            status: 200,
+                            error_slug: String::new(),
+                        },
+                        DailyCounters {
+                            request_count: 7,
+                            latency_sum_us: 21_000,
+                        },
+                    )],
+                    vec![(
+                        LatencyKey {
+                            day: "2026-07-30".to_string(),
+                            tenant_id: "t1".to_string(),
+                            bucket_le_ms: 5,
+                        },
+                        7,
+                    )],
+                )
+                .await
+                .unwrap();
+        }
+        // `store` dropped — simulates a container restart against the same file.
+
+        let (store, _bootstrap) = Store::open(&config).await.unwrap();
+        let rows = store
+            .query_usage_daily(None, "2026-07-01", "2026-07-31")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_count, 7);
+        assert_eq!(rows[0].latency_sum_us, 21_000);
+        assert_eq!(rows[0].error_slug, "");
+
+        let latency = store
+            .query_usage_latency(None, "2026-07-01", "2026-07-31")
+            .await
+            .unwrap();
+        assert_eq!(latency.len(), 1);
+        assert_eq!(latency[0].request_count, 7);
+    }
+
+    /// The `ON CONFLICT … DO UPDATE` clause exists to make repeated flushes
+    /// additive. If it ever became an overwrite, every flush but the last
+    /// would vanish — so this gets its own test.
+    #[tokio::test]
+    async fn flushing_the_same_key_twice_accumulates() {
+        let (store, _bootstrap) = open_test_store().await;
+        let key = DailyKey {
+            day: "2026-07-30".to_string(),
+            tenant_id: "t1".to_string(),
+            language: "en_US".to_string(),
+            status: 200,
+            error_slug: String::new(),
+        };
+        let latency_key = LatencyKey {
+            day: "2026-07-30".to_string(),
+            tenant_id: "t1".to_string(),
+            bucket_le_ms: 5,
+        };
+
+        for _ in 0..3 {
+            store
+                .flush_usage(
+                    vec![(
+                        key.clone(),
+                        DailyCounters {
+                            request_count: 2,
+                            latency_sum_us: 4_000,
+                        },
+                    )],
+                    vec![(latency_key.clone(), 2)],
+                )
+                .await
+                .unwrap();
+        }
+
+        let rows = store
+            .query_usage_daily(None, "2026-07-30", "2026-07-30")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "still one row, not three");
+        assert_eq!(rows[0].request_count, 6);
+        assert_eq!(rows[0].latency_sum_us, 12_000);
+
+        let latency = store
+            .query_usage_latency(None, "2026-07-30", "2026-07-30")
+            .await
+            .unwrap();
+        assert_eq!(latency[0].request_count, 6);
+    }
+
+    #[tokio::test]
+    async fn usage_queries_filter_by_tenant_and_window() {
+        let (store, _bootstrap) = open_test_store().await;
+        let row = |tenant: &str, day: &str| {
+            (
+                DailyKey {
+                    day: day.to_string(),
+                    tenant_id: tenant.to_string(),
+                    language: "en_US".to_string(),
+                    status: 200,
+                    error_slug: String::new(),
+                },
+                DailyCounters {
+                    request_count: 1,
+                    latency_sum_us: 1_000,
+                },
+            )
+        };
+        store
+            .flush_usage(
+                vec![
+                    row("t1", "2026-07-30"),
+                    row("t2", "2026-07-30"),
+                    row("t1", "2026-06-01"),
+                ],
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let scoped = store
+            .query_usage_daily(Some("t1"), "2026-07-01", "2026-07-31")
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped.len(),
+            1,
+            "other tenant and out-of-window day excluded"
+        );
+        assert_eq!(scoped[0].request_count, 1);
+
+        let platform = store
+            .query_usage_daily(None, "2026-07-01", "2026-07-31")
+            .await
+            .unwrap();
+        assert_eq!(
+            platform[0].request_count, 2,
+            "platform scope sums across tenants"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_drops_only_rows_older_than_the_cutoff() {
+        let (store, _bootstrap) = open_test_store().await;
+        let key = |day: &str| DailyKey {
+            day: day.to_string(),
+            tenant_id: "t1".to_string(),
+            language: "en_US".to_string(),
+            status: 200,
+            error_slug: String::new(),
+        };
+        let counters = DailyCounters {
+            request_count: 1,
+            latency_sum_us: 1_000,
+        };
+        store
+            .flush_usage(
+                vec![(key("2026-01-01"), counters), (key("2026-07-30"), counters)],
+                vec![(
+                    LatencyKey {
+                        day: "2026-01-01".to_string(),
+                        tenant_id: "t1".to_string(),
+                        bucket_le_ms: 5,
+                    },
+                    1,
+                )],
+            )
+            .await
+            .unwrap();
+
+        let purged = store.purge_usage_before("2026-07-01").await.unwrap();
+        assert_eq!(purged, 2, "one daily row and one latency row");
+
+        let remaining = store
+            .query_usage_daily(None, "2020-01-01", "2030-01-01")
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].day, "2026-07-30");
     }
 
     #[tokio::test]

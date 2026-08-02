@@ -104,6 +104,34 @@ Every deployment is tenant-scoped, including a self-hosted single-org install (w
 - **F45** Each tenant has a request quota: `quota_limit` (max spellcheck requests per billing period) and a `request_count` incremented on every `/spellcheck*` call attributable to that tenant (by any of its keys). Once `request_count >= quota_limit`, further spellcheck requests return 429 until the period is reset.
 - **F46** The quota period (`period_start`/`period_end`) and `request_count` reset are controlled entirely by the platform/billing app via F37's `PATCH /tenants/{id}`; the server does not auto-reset the counter when `period_end` passes. A tenant whose period has lapsed without a billing-app update stays blocked.
 
+### 3.10 Usage Metrics
+
+The billing app's usage dashboard needs latency, error, and language history. Nothing in §3.5 provides it: Prometheus metrics are in-process and die with the process, and F45's `request_count` is a single running integer with no time dimension. This section adds a durable daily rollup and the endpoints that read it.
+
+**Recording**
+
+- **F47** Requests that reach a `/spellcheck*` handler are recorded into a durable daily usage rollup keyed by UTC date, tenant, resolved language, response status, and error slug. Requests rejected by the auth/tenant/origin/quota middleware are *not* recorded — the rollup counts billable work only, matching F45's `request_count` exactly.
+- **F48** Each rollup row accumulates a request count plus latency histogram buckets sufficient to interpolate p50/p95/p99 for that date. Boundaries are fixed at compile time, not configurable: changing them would invalidate comparison against already-stored rows.
+- **F49** Recording is non-blocking and must never fail a spellcheck request. Per the F45/F46 precedent, undercounting on crash is acceptable; over-counting is not.
+- **F50** Rollup rows survive process restart and container recreation, verified by a file-backed store close/reopen test (never `:memory:`).
+- **F51** Rollup rows older than 90 days are purged automatically.
+- **F52** The rollup key set is bounded: date × tenant × language × status × error slug. Error slugs come from the closed `AppError` set (F08); no free-form values enter the key.
+- **F53** All rollup columns are `NOT NULL` — language is always resolved because only handler-reaching requests are recorded. Any future nullable column requires the documented `sqlx::Any` `COALESCE` workaround.
+
+**Endpoints**
+
+- **F54** `GET /usage/daily` returns per-day request count, average latency, and error count.
+- **F55** `GET /usage/latency` returns p50/p95/p99 interpolated from F48's buckets.
+- **F56** `GET /usage/errors` returns counts carrying both dimensions — HTTP status *and* `AppError` slug (e.g. `{"status": 400, "error_code": "validation", "count": 12}`).
+- **F57** `GET /usage/languages` returns request count and percentage-of-total per language.
+- **F58** All four accept optional `start`/`end` (`YYYY-MM-DD`). Supplied → responses carry a per-date dimension for trend charts. Omitted → a single flat aggregate, except `/usage/daily`, which is always per-date (an undated "daily" aggregate is meaningless) and uses the window only to bound the range. Supplying just one of the two is a 400.
+- **F59** The default window when `start`/`end` are omitted is scope-dependent: an `admin` caller gets its own tenant's current billing period (F46's `period_start`/`period_end`); a `platform` caller gets a rolling last 30 days, since billing periods differ across tenants.
+- **F60** A `platform` key receives cross-tenant aggregates; an `admin` key receives its own tenant only; a `standard` key is rejected (403), consistent with F30.
+- **F61** Cross-tenant data must never appear in an admin-scoped response, including in `/usage/languages` percentage denominators.
+- **F62** Invalid or inverted `start`/`end` values return RFC 7807 `application/problem+json` 400 (F08) with a corresponding `docs/errors/{slug}.md` page.
+- **F63** All four endpoints appear in the F03 OpenAPI spec and pass its validation test.
+- **F64** F39's `GET /tenant` is unchanged: it remains the live quota-enforcement counter answering "am I near my cap?", while `/usage/*` is the historical rollup answering "what did I use, when?". The two may legitimately differ by the flush lag.
+
 ## 4. Non-Functional Requirements
 
 | ID | Requirement | Target |
@@ -118,6 +146,10 @@ Every deployment is tenant-scoped, including a self-hosted single-org install (w
 | NF08 | Test coverage | Unit tests for modules, integration tests for endpoints, benchmarks |
 | NF09 | Documentation | OpenAPI spec, README, inline doc comments |
 | NF10 | API key entropy | Raw key values must use a cryptographically secure RNG with sufficient length to make brute-force guessing impractical |
+| NF11 | Usage recording overhead | No regression against NF01 (p50 < 5 ms), proven by the existing Criterion benchmark |
+| NF12 | Usage query latency | Within NF02 (p95 < 50 ms) for a default-window query at full 90-day retention |
+| NF13 | Usage storage growth | Bounded by F51/F52 — roughly 180k rows at 100 tenants × 5 languages × 4 statuses × 90 days |
+| NF14 | Usage backend parity | Identical behaviour on SQLite and PostgreSQL (F33a) |
 
 ## 5. User Stories
 
@@ -138,6 +170,11 @@ Every deployment is tenant-scoped, including a self-hosted single-org install (w
 - **US15** As an API consumer, I want to specify a language per spellcheck request so that one tenant can check text in multiple languages without provisioning separate tenants.
 - **US16** As a billing app, I want to suspend a tenant independent of its quota so that non-payment or ToS violations can be enforced immediately.
 - **US17** As a tenant admin, I want to view my own tenant's usage and plan via the API so that I don't need billing-app access just to check my quota.
+- **US18** As a platform operator, I want cross-tenant latency, error, and language trends so that the billing app's usage dashboard has something to render.
+- **US19** As a tenant admin, I want my own usage trends so that I can see my traffic without platform access, and without ever seeing another tenant's.
+- **US20** As an operator, I want usage history to survive deploys so that the dashboard doesn't reset to zero on every release.
+- **US21** As an operator, I want usage storage bounded by a retention window so that the database doesn't grow without limit.
+- **US22** As a dashboard consumer, I want the usage endpoints to return empty arrays rather than errors before data accumulates, so that a fresh install renders an honest empty state instead of a 500.
 
 ## 6. Decisions
 
@@ -170,10 +207,19 @@ Every deployment is tenant-scoped, including a self-hosted single-org install (w
 | OpenAPI spec | Hand-written static spec plus a validation test. |
 | Spell-check engine | `spellbook` (pure Rust, Hunspell-compatible). |
 | Deployment | Include a Dockerfile and docker-compose.yml. |
+| Usage data source | A durable daily rollup table in the store, not the Prometheus registry (in-process, wiped on restart) and not an external TSDB (extra infra dependency). All four `/usage/*` endpoints derive from the one table. |
+| Usage recording scope | `/spellcheck*` handler-reaching requests only, so rollup counts equal billable requests. Consequence: `/usage/errors` never shows 401/403/429 — those are rejected upstream by middleware — so it covers `validation`, malformed-JSON, and `internal` only. Accepted; Prometheus and logs cover rejection debugging. |
+| Latency percentiles | Fixed logarithmic-ish ms bucket ladder per row, percentiles interpolated at query time. Bounded storage and mergeable across dates and tenants, at ±half a bucket width. Reservoir sampling rejected (samples don't merge across tenants); sum/count/max rejected (percentiles not derivable). |
+| Usage retention | 90 days, purged automatically — enough for month-over-month comparison at single-digit MB. |
+| Usage default window | Admin scope: the caller's current billing period, so it lines up with the quota counter. Platform scope: rolling last 30 days, since "current billing period" is undefined across many tenants. |
+| Usage error identifiers | Both HTTP status and `AppError` slug per row — `400` alone doesn't distinguish validation from malformed JSON. |
+| Usage backfill | None. Charts fill in from first deploy; seeding a synthetic row from `request_count` would date a lifetime total to one day and carry no latency, language, or status breakdown. |
 
 ## 7. Remaining Open Questions
 
-No major product questions remain, including for API key authentication (§3.7–3.8) and SaaS multi-tenancy (§3.9). One deferred design detail: the exact shape of the per-tenant CORS-origin management endpoints (F41) — CRUD-equivalent to `/api-keys`, but not spec'd field-by-field here; resolve in `/sc:design`. The next step is architecture/design.
+No major product questions remain, including for API key authentication (§3.7–3.8), SaaS multi-tenancy (§3.9), and usage metrics (§3.10). One deferred design detail: the exact shape of the per-tenant CORS-origin management endpoints (F41) — CRUD-equivalent to `/api-keys`, but not spec'd field-by-field here; resolve in `/sc:design`. The next step is architecture/design.
+
+**External dependency (out of scope here):** the `spellcheckapi.com` PHP app must inject a platform- or admin-authenticated HTTP client into `RustMetricsService` and add the four routes to its `e2e/mock-api-server.js`. The endpoints are inert until it does. Tracked in that repository, not this one.
 
 ## 7. Known Blockers
 

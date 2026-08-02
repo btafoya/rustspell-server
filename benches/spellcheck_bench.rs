@@ -10,6 +10,7 @@ use rustspell_server::{
     engine::{Engine, EngineRegistry},
     handlers::{build_app, AppState},
     store::{Role, Store},
+    usage::UsageRecorder,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -63,6 +64,7 @@ world
         Arc::new(config),
         Arc::new(store),
         rate_limiter,
+        Arc::new(UsageRecorder::new()),
     ));
     (build_app(state), key)
 }

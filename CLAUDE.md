@@ -108,7 +108,7 @@ Never reason from assumptions, always reason from the actual data. You need to r
 - Do not reintroduce `nuspell-sys`; it was removed because no usable published crate exists.
 - Do not use a wildcard CORS fallback. `RUSTSPELL_CORS_ORIGINS` no longer exists — origins are per-tenant, managed via `/tenant/origins*` (`DESIGN.md` §21–23).
 - Keep handlers thin; business logic belongs in `src/engine.rs` and `src/dictionary.rs`.
-- Maintain `AppState` as `Arc<EngineRegistry>` + `Arc<Config>` + `Arc<Store>` + `Arc<RateLimiter>` shared read-only state.
+- Maintain `AppState` as `Arc<EngineRegistry>` + `Arc<Config>` + `Arc<Store>` + `Arc<RateLimiter>` + `Arc<UsageRecorder>` shared state.
 - Tower/axum layer stacking: the *last* `.layer()`/`.route_layer()` added is outermost and runs *first* on a request — opposite of "added first runs first." Order middleware accordingly (see `handlers::build_app` for the pattern).
 - New `AppError` variant → add a matching `docs/errors/{slug}.md` page (the RFC 7807 `type` field links there).
 

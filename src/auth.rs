@@ -245,6 +245,70 @@ pub async fn require_active_tenant(
     next.run(request).await
 }
 
+/// Which slice of the usage rollup a `/usage/*` caller may read (§26.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsageScope {
+    /// Cross-tenant aggregates, for the billing app's platform key.
+    Platform,
+    /// Restricted to one tenant. Handlers pass this straight through to the
+    /// store's `tenant_id` filter, which is what makes F61 structural.
+    Tenant(String),
+}
+
+/// Gate for `/usage/*`. The existing groups can't express this one: F60 admits
+/// both `platform` (no tenant) and `admin` (tenant-scoped), while
+/// [`require_active_tenant`] assumes a tenant exists and
+/// [`require_platform_key`] excludes admins. Composes the same checks those
+/// layers make rather than reimplementing them. Must run after
+/// [`require_active_key`].
+pub async fn require_usage_scope(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let record = request
+        .extensions()
+        .get::<KeyRecord>()
+        .expect("require_usage_scope must be layered after require_active_key")
+        .clone();
+
+    let scope = match record.role {
+        // Usage is not self-service telemetry for an ordinary integration key.
+        Role::Standard => return AppError::Forbidden.into_response(),
+        Role::Platform => {
+            // Same server-to-server rule as F43a: a platform key has no
+            // tenant and therefore no registered origins to bind against.
+            if request.headers().contains_key(header::ORIGIN) {
+                return AppError::Forbidden.into_response();
+            }
+            UsageScope::Platform
+        }
+        Role::Admin => {
+            let Some(tenant_id) = record.tenant_id.clone() else {
+                return AppError::Forbidden.into_response();
+            };
+            let Some(tenant) = state.store.get_tenant(&tenant_id) else {
+                return AppError::Forbidden.into_response();
+            };
+            if tenant.suspended_at.is_some() {
+                return AppError::Forbidden.into_response();
+            }
+            if let Some(origin) = request.headers().get(header::ORIGIN) {
+                let Ok(origin_str) = origin.to_str() else {
+                    return AppError::Forbidden.into_response();
+                };
+                if !state.store.tenant_owns_origin(&tenant_id, origin_str) {
+                    return AppError::Forbidden.into_response();
+                }
+            }
+            UsageScope::Tenant(tenant_id)
+        }
+    };
+
+    request.extensions_mut().insert(scope);
+    next.run(request).await
+}
+
 /// Enforces the calling tenant's request quota on `/spellcheck*` only.
 /// Rejects (429, distinct from [`AppError::RateLimited`]) if the tenant is
 /// at or over `quota_limit`; otherwise consumes one unit of quota. Must run

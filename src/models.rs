@@ -282,6 +282,76 @@ pub struct OriginListResponse {
     pub origins: Vec<OriginMetadata>,
 }
 
+/// Optional window shared by every `/usage/*` endpoint. Supplying exactly one
+/// of the two is rejected (F58); omitting both selects the scope-dependent
+/// default window (F59).
+#[derive(Debug, Default, Deserialize)]
+pub struct UsageQuery {
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+/// One day in `GET /usage/daily`. Always dated — F58's carve-out.
+#[derive(Debug, Serialize)]
+pub struct DailyUsageRow {
+    pub date: String,
+    pub requests: u64,
+    pub average_latency_ms: u64,
+    pub errors: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DailyUsageResponse {
+    pub daily_usage: Vec<DailyUsageRow>,
+}
+
+/// One percentile in `GET /usage/latency`. `date` is present only when the
+/// caller supplied an explicit window.
+#[derive(Debug, Serialize)]
+pub struct LatencyTrend {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    pub percentile: String,
+    pub value_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LatencyResponse {
+    pub latency_trends: Vec<LatencyTrend>,
+}
+
+/// One error group in `GET /usage/errors`, carrying both dimensions (F56).
+/// `error_code` is the `AppError` slug, identical to the tail of the RFC 7807
+/// `type` URI, so a dashboard can link straight to the docs page.
+#[derive(Debug, Serialize)]
+pub struct ErrorTrend {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    pub status: u16,
+    pub error_code: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorsResponse {
+    pub error_trends: Vec<ErrorTrend>,
+}
+
+/// One language group in `GET /usage/languages`.
+#[derive(Debug, Serialize)]
+pub struct LanguageDistribution {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    pub language: String,
+    pub count: u64,
+    pub percentage: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LanguagesResponse {
+    pub language_distribution: Vec<LanguageDistribution>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

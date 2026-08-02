@@ -33,7 +33,16 @@ pub enum AppError {
     QuotaExceeded,
     #[error("unsupported language: {0}")]
     UnsupportedLanguage(String),
+    #[error("invalid date range: {0}")]
+    InvalidDateRange(String),
 }
+
+/// The RFC 7807 slug of the error that produced a response, attached to the
+/// response extensions so the usage recorder can group by error identifier
+/// without re-deriving it (`DESIGN.md` §26.3). Sharing `problem_slug` with
+/// the `type` URI means the two can never drift apart.
+#[derive(Debug, Clone, Copy)]
+pub struct ProblemSlug(pub &'static str);
 
 /// RFC 7807 Problem Details object.
 #[derive(Debug, Serialize)]
@@ -58,11 +67,14 @@ impl AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
             AppError::UnsupportedLanguage(_) => StatusCode::BAD_REQUEST,
+            AppError::InvalidDateRange(_) => StatusCode::BAD_REQUEST,
         }
     }
 
-    fn problem_type(&self) -> String {
-        let slug = match self {
+    /// Stable identifier for this error, used both as the tail of the
+    /// `type` URI and as `/usage/errors`'s `error_code` (F56).
+    pub fn problem_slug(&self) -> &'static str {
+        match self {
             AppError::Validation(_) => "validation-error",
             AppError::JsonRejection(_) => "invalid-json",
             AppError::DictionaryDownload(_) => "dictionary-download-error",
@@ -74,7 +86,12 @@ impl AppError {
             AppError::NotFound => "not-found",
             AppError::QuotaExceeded => "quota-exceeded",
             AppError::UnsupportedLanguage(_) => "unsupported-language",
-        };
+            AppError::InvalidDateRange(_) => "invalid-date-range",
+        }
+    }
+
+    fn problem_type(&self) -> String {
+        let slug = self.problem_slug();
         format!("https://github.com/btafoya/rustspell-server/blob/main/docs/errors/{slug}.md")
     }
 
@@ -91,6 +108,7 @@ impl AppError {
             AppError::NotFound => "Not found",
             AppError::QuotaExceeded => "Quota exceeded",
             AppError::UnsupportedLanguage(_) => "Unsupported language",
+            AppError::InvalidDateRange(_) => "Invalid date range",
         }
     }
 }
@@ -109,12 +127,14 @@ impl IntoResponse for AppError {
             detail: self.to_string(),
         };
 
+        let slug = self.problem_slug();
         let mut response = (
             status,
             [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
             Json(body),
         )
             .into_response();
+        response.extensions_mut().insert(ProblemSlug(slug));
 
         if let Some(secs) = retry_after_secs {
             if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {

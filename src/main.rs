@@ -12,6 +12,7 @@ use rustspell_server::{
     handlers::{self, AppState},
     metrics,
     store::Store,
+    usage::{self, UsageRecorder},
 };
 
 #[tokio::main]
@@ -58,12 +59,22 @@ async fn main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(config.auth_rate_limit_cooldown_seconds),
     );
 
+    let store = Arc::new(store);
+    let usage_recorder = Arc::new(UsageRecorder::new());
+
     let app_state = Arc::new(AppState::new(
         Arc::new(engines),
         Arc::new(config.clone()),
-        Arc::new(store),
+        store.clone(),
         Arc::new(rate_limiter),
+        usage_recorder.clone(),
     ));
+
+    // Drain the usage buffer to the store on a fixed interval, and purge rows
+    // past the retention window daily (§26.4, §26.8). Purging once at startup
+    // matters because a server down for a week would otherwise carry stale
+    // rows until its first interval fires.
+    spawn_usage_tasks(store.clone(), usage_recorder.clone());
 
     // Build public API router
     let app = handlers::build_app(app_state);
@@ -94,9 +105,48 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown)
     .await
     .map_err(|e| anyhow::anyhow!("API server error: {e}"))?;
+
+    // Flush the last partial interval so a clean deploy loses no usage data;
+    // only an unclean kill costs up to FLUSH_INTERVAL (§26.4).
+    let (daily, latency) = usage_recorder.drain();
+    if let Err(e) = store.flush_usage(daily, latency).await {
+        tracing::error!("final usage flush failed: {e}");
+    }
     tracing::info!("API server shut down gracefully");
 
     Ok(())
+}
+
+/// Spawns the periodic usage flush and the daily retention purge.
+fn spawn_usage_tasks(store: Arc<Store>, recorder: Arc<UsageRecorder>) {
+    let flush_store = store.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(usage::FLUSH_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let (daily, latency) = recorder.drain();
+            if let Err(e) = flush_store.flush_usage(daily, latency).await {
+                // Losing a batch undercounts, which F49 permits; failing the
+                // task would silently stop all recording, which it does not.
+                tracing::error!("usage flush failed: {e}");
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            ticker.tick().await;
+            match store
+                .purge_usage_before(&usage::retention_cutoff_day())
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("purged {n} usage rows past the retention window"),
+                Err(e) => tracing::error!("usage purge failed: {e}"),
+            }
+        }
+    });
 }
 
 /// Handles graceful shutdown via SIGINT/SIGTERM on Unix and SIGINT on Windows.
