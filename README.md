@@ -185,16 +185,11 @@ If the bootstrap platform key is lost or compromised, run the offline
 server container first, then:
 
 **Docker Compose**
-
-```bash
+# With Docker Compose (server stopped)
 docker compose run --rm rustspell reset-platform-key --yes
-```
 
-**Plain Docker**
-
-```bash
-docker run --rm -v rustspell-data:/data rustspell-server reset-platform-key --yes
-```
+# Machine-readable
+docker compose run --rm rustspell reset-platform-key --yes --json
 
 This rotates the existing `bootstrap` platform key in place (same id/label,
 new raw value) and prints the new key once. Add `--json` for machine-readable
