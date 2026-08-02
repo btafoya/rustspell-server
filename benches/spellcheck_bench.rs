@@ -32,6 +32,8 @@ world
         dictionary_url: "https://example.com".to_string(),
         dictionary_dir: std::path::PathBuf::from("/tmp"),
         refresh_interval_hours: 24,
+        dictionary_admin_cidrs: Vec::new(),
+        trusted_proxies: Vec::new(),
         db_path: std::path::PathBuf::from("/tmp/rustspell-bench.db"),
         db_url: Some("sqlite::memory:".to_string()),
         auth_rate_limit_max: 10,
