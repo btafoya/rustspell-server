@@ -39,13 +39,13 @@ The server is a single Tokio binary with two TCP listeners: the public API on `R
 | `src/models.rs` | Serde request/response structs and `validator` constraints. |
 | `src/engine.rs` | Thin, thread-safe wrapper around `spellbook::Dictionary`, plus `EngineRegistry` (§25): a cache of loaded `Engine`s keyed by language for per-request language overrides. |
 | `src/dictionary.rs` | Download, cache, and refresh Hunspell `.aff`/`.dic` files from LibreOffice `.oxt` archives, parameterized by language (not just the configured default). |
-| `src/handlers.rs` | HTTP handlers for `/health`, `/docs`, `/spellcheck`, `/spellcheck/positions`, `/api-keys*`, `/tenant*`, `/tenants*` (§22). |
+| `src/handlers.rs` | HTTP handlers for `/health`, `/docs`, `/languages`, `/dictionaries`, `/spellcheck`, `/spellcheck/positions`, `/api-keys*`, `/tenant*`, `/tenants*` (§22, §27). |
 | `src/middleware.rs` | CORS layer; dynamic per-tenant `AllowOrigin::predicate` (§23) replaces the static allow-list. |
 | `src/metrics.rs` | Prometheus recorder and mini HTTP server on the metrics port. |
 | `src/openapi.rs` | Static OpenAPI 3.0 JSON document and validation helper. |
 | `src/swagger.rs` | Swagger UI portal served at `/ui` using `swagger-ui-dist`; `/` redirects there. |
 | `src/store.rs` | Pluggable persistence layer (SQLite or PostgreSQL, §20): keys, tenants, and registered origins, plus in-memory read caches for the auth/CORS hot path. Renamed and broadened from the single-tenant design's `keystore.rs` (§17) — see §20 for why. |
-| `src/auth.rs` | Axum middleware: `X-API-Key` extraction/validation, role gates (`platform`/`admin`/`standard`), origin binding (§23), quota enforcement (§24), and per-IP auth-failure rate limiting. |
+| `src/auth.rs` | Axum middleware: `X-API-Key` extraction/validation, role gates (`platform`/`admin`/`standard`), origin binding (§23), quota enforcement (§24), dictionary-admin IP gate with `X-Forwarded-For` resolution (§27.3), and per-IP auth-failure rate limiting. |
 | `src/usage.rs` | Usage rollup recorder (§26): in-memory accumulation buffer, latency bucket ladder, percentile interpolation, and the scope/window resolution shared by the four `/usage/*` handlers. All SQL stays in `store.rs`. |
 | `benches/spellcheck_bench.rs` | Criterion benchmarks for `/spellcheck` throughput. |
 
@@ -1166,3 +1166,45 @@ A second background task, on a 24-hour interval and once at startup, deletes fro
 - **Window resolution** — inverted range → 400; single param → 400; tenant with unset billing period → 30-day fallback, not an error.
 - **Recording scope** — a quota-rejected (429) request records nothing, proving the layer ordering in §26.3 is correct. This is the single test most likely to catch a future refactor that moves `record_usage` outward.
 - **OpenAPI** — all four paths present, spec-validation test passing (F63).
+
+## 27. Language discovery and dictionary registration
+
+### 27.1 `GET /languages`
+
+Public, unauthenticated endpoint returning every language the server can serve: the union of locally cached dictionaries and registered dictionary source URLs. Each row carries `code`, `cached`, and `registered` booleans so a caller can tell whether a language is ready to use (`cached=true`), merely configured (`registered=true`), or both.
+
+```json
+{"languages":[{"code":"en_US","cached":true,"registered":false},{"code":"fr_FR","cached":false,"registered":true}]}
+```
+
+Because it is called by browsers before a tenant or API key exists, `/languages` is exempt from the per-tenant CORS origin gate (§23). The exemption is path-scoped inside the existing `AllowOrigin::predicate` rather than a second CORS layer.
+
+### 27.2 `POST /dictionaries`
+
+Registers a new dictionary locale and source URL template, persists it in the `dictionaries` table, then downloads, parses, and caches the `.aff`/`.dic` pair so the language is immediately available for spell-checking. Restricted to `platform` keys and, when configured, callers from `RUSTSPELL_DICTIONARY_ADMIN_CIDRS`.
+
+The request body is validated as an RFC 7807 400 when the language code is malformed or the `source_url` is not `http(s)`. A download/parse failure during warming is also a 400 (`unsupported-language`), not a 500 — the caller supplied the URL.
+
+### 27.3 IP allow-list and trusted proxies
+
+`RUSTSPELL_DICTIONARY_ADMIN_CIDRS` is a comma-separated CIDR list. Empty or unset means no network restriction beyond the platform-key gate. `RUSTSPELL_TRUSTED_PROXIES` controls when the `X-Forwarded-For` header is consulted: only when the direct TCP peer falls inside a trusted proxy network. The resolved client IP walks the forwarded chain from right to left and returns the first address that is not itself a trusted proxy.
+
+Like `/tenants*`, this endpoint rejects any request carrying an `Origin` header: it is server-to-server only.
+
+### 27.4 Startup warming
+
+`main.rs` pre-warms every dictionary registered in the store before binding the API port. If any registered dictionary cannot be downloaded or parsed, the process exits with a descriptive error. This keeps the fail-fast behavior already applied to the configured default language (§5.3) from being undermined by a newly registered dictionary.
+
+### 27.5 Storage
+
+Dictionary source URLs live in a dedicated `dictionaries` table alongside the key/tenant store, not in a sidecar file. The table is created by `Store::init_schema` and read into an in-memory cache on open, matching the pattern used for keys and tenants. The source URL is a per-code template; `DictionaryManager` substitutes `{code}.aff` and `{code}.dic` under it.
+
+### 27.6 Testing
+
+- Public `/languages` returns 200 without an API key.
+- CORS preflight for an unregistered origin against `/languages` is allowed.
+- `/languages` includes both cached-on-disk and registered-but-not-cached languages.
+- `POST /dictionaries` with a `platform` key and a local HTTP source warms the language and makes it usable by `/spellcheck`.
+- Non-platform keys, `Origin` headers, and out-of-CIDR IPs are rejected.
+- `X-Forwarded-For` is honored only when the peer is in `RUSTSPELL_TRUSTED_PROXIES`.
+- Startup warming failure path is covered by a bad source URL registered in a test store.

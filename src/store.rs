@@ -88,6 +88,14 @@ pub struct OriginInfo {
     pub created_at: u64,
 }
 
+/// A registered dictionary locale and its source URL template.
+#[derive(Debug, Clone)]
+pub struct DictionaryInfo {
+    pub code: String,
+    pub source_url: String,
+    pub created_at: u64,
+}
+
 /// A freshly generated key: the raw value is only ever available here, once.
 pub struct CreatedApiKey {
     pub record: KeyRecord,
@@ -101,6 +109,8 @@ pub struct Store {
     origins_any: RwLock<HashSet<String>>,
     /// tenant id -> origin string -> full record, so `list_origins` needs no I/O.
     origins_by_tenant: RwLock<HashMap<String, HashMap<String, OriginInfo>>>,
+    /// code -> full record, so `list_dictionaries` needs no I/O.
+    dictionaries: RwLock<HashMap<String, DictionaryInfo>>,
 }
 
 impl Store {
@@ -142,6 +152,7 @@ impl Store {
             tenants: RwLock::new(HashMap::new()),
             origins_any: RwLock::new(HashSet::new()),
             origins_by_tenant: RwLock::new(HashMap::new()),
+            dictionaries: RwLock::new(HashMap::new()),
         };
 
         store.reload_caches().await?;
@@ -204,6 +215,17 @@ impl Store {
                     .entry(info.tenant_id.clone())
                     .or_default()
                     .insert(info.origin.clone(), info);
+            }
+        }
+
+        let dictionary_rows = sqlx::query("SELECT code, source_url, created_at FROM dictionaries")
+            .fetch_all(&self.pool)
+            .await?;
+        {
+            let mut dictionaries = self.dictionaries.write().unwrap();
+            for row in dictionary_rows {
+                let info = dictionary_info_from_row(&row)?;
+                dictionaries.insert(info.code.clone(), info);
             }
         }
 
@@ -668,6 +690,58 @@ impl Store {
             .unwrap_or(false)
     }
 
+    // ---- Dictionaries ----------------------------------------------------
+
+    /// Persist a new dictionary locale and its source URL, or update the URL
+    /// if the locale is already registered. Returns the actual stored record
+    /// (preserving the original `created_at`).
+    pub async fn register_dictionary(
+        &self,
+        code: String,
+        source_url: String,
+    ) -> anyhow::Result<DictionaryInfo> {
+        let created_at = now();
+
+        sqlx::query(
+            "INSERT INTO dictionaries (code, source_url, created_at) VALUES (?, ?, ?) \
+             ON CONFLICT (code) DO UPDATE SET source_url = excluded.source_url",
+        )
+        .bind(&code)
+        .bind(&source_url)
+        .bind(created_at as i64)
+        .execute(&self.pool)
+        .await?;
+
+        let row =
+            sqlx::query("SELECT code, source_url, created_at FROM dictionaries WHERE code = ?")
+                .bind(&code)
+                .fetch_one(&self.pool)
+                .await?;
+        let info = dictionary_info_from_row(&row)?;
+
+        self.dictionaries
+            .write()
+            .unwrap()
+            .insert(code, info.clone());
+
+        Ok(info)
+    }
+
+    /// Sync, cache-only — no I/O.
+    pub fn list_dictionaries(&self) -> Vec<DictionaryInfo> {
+        self.dictionaries
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Sync, cache-only — no I/O.
+    pub fn get_dictionary(&self, code: &str) -> Option<DictionaryInfo> {
+        self.dictionaries.read().unwrap().get(code).cloned()
+    }
+
     // ---- Usage rollup (§26) --------------------------------------------
 
     /// Applies a drained [`UsageRecorder`](crate::usage::UsageRecorder) batch.
@@ -896,6 +970,16 @@ async fn init_schema(pool: &AnyPool) -> anyhow::Result<()> {
     // documented below — `error_slug = ''` is what buys that on the one column
     // that would otherwise be nullable.
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS dictionaries (
+            code        TEXT PRIMARY KEY,
+            source_url  TEXT NOT NULL,
+            created_at  BIGINT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS usage_daily (
             day            TEXT   NOT NULL,
             tenant_id      TEXT   NOT NULL,
@@ -998,6 +1082,15 @@ fn origin_info_from_row(row: &AnyRow) -> anyhow::Result<OriginInfo> {
     })
 }
 
+fn dictionary_info_from_row(row: &AnyRow) -> anyhow::Result<DictionaryInfo> {
+    let created_at: i64 = row.try_get("created_at")?;
+    Ok(DictionaryInfo {
+        code: row.try_get("code")?,
+        source_url: row.try_get("source_url")?,
+        created_at: created_at as u64,
+    })
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1040,6 +1133,7 @@ mod tests {
             tenants: RwLock::new(HashMap::new()),
             origins_any: RwLock::new(HashSet::new()),
             origins_by_tenant: RwLock::new(HashMap::new()),
+            dictionaries: RwLock::new(HashMap::new()),
         };
         store.reload_caches().await.unwrap();
         let bootstrap = if !store.has_active_platform_key() {
@@ -1162,6 +1256,8 @@ mod tests {
             dictionary_url: "https://example.com".to_string(),
             dictionary_dir: dir.path().to_path_buf(),
             refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
             db_path: dir.path().join("test.db"),
             db_url: None,
             auth_rate_limit_max: 10,
@@ -1205,6 +1301,8 @@ mod tests {
             dictionary_url: "https://example.com".to_string(),
             dictionary_dir: dir.path().to_path_buf(),
             refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
             db_path: dir.path().join("usage.db"),
             db_url: None,
             auth_rate_limit_max: 10,
@@ -1479,6 +1577,67 @@ mod tests {
         assert!(!store.is_registered_origin("https://app.example.com"));
     }
 
+    #[tokio::test]
+    async fn register_dictionary_and_list() {
+        let (store, _bootstrap) = open_test_store().await;
+
+        let info = store
+            .register_dictionary("fr_FR".to_string(), "https://example.com/fr".to_string())
+            .await
+            .unwrap();
+        assert_eq!(info.code, "fr_FR");
+        assert_eq!(info.source_url, "https://example.com/fr");
+
+        let list = store.list_dictionaries();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].code, "fr_FR");
+
+        // Upsert updates the source_url but preserves the original created_at.
+        let original_created_at = info.created_at;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let updated = store
+            .register_dictionary("fr_FR".to_string(), "https://example.com/fr2".to_string())
+            .await
+            .unwrap();
+        assert_eq!(updated.source_url, "https://example.com/fr2");
+        assert_eq!(updated.created_at, original_created_at);
+    }
+
+    #[tokio::test]
+    async fn reopen_file_backed_store_preserves_dictionaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            port: 3000,
+            metrics_port: 9090,
+            log_level: "info".to_string(),
+            language: "en_US".to_string(),
+            dictionary_url: "https://example.com".to_string(),
+            dictionary_dir: dir.path().to_path_buf(),
+            refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
+            db_path: dir.path().join("dict.db"),
+            db_url: None,
+            auth_rate_limit_max: 10,
+            auth_rate_limit_window_seconds: 60,
+            auth_rate_limit_cooldown_seconds: 60,
+        };
+
+        {
+            let (store, _bootstrap) = Store::open(&config).await.unwrap();
+            store
+                .register_dictionary("de_DE".to_string(), "https://example.com/de".to_string())
+                .await
+                .unwrap();
+        }
+
+        let (store, _bootstrap) = Store::open(&config).await.unwrap();
+        let info = store
+            .get_dictionary("de_DE")
+            .expect("dictionary survived reopen");
+        assert_eq!(info.source_url, "https://example.com/de");
+    }
+
     /// Same code path as the SQLite tests above, run against a real Postgres
     /// instance when one is available. Skips (not fails) if `TEST_DATABASE_URL`
     /// is unset, per DESIGN.md §14 — there's no Postgres in this sandbox, so this
@@ -1504,6 +1663,7 @@ mod tests {
             tenants: RwLock::new(HashMap::new()),
             origins_any: RwLock::new(HashSet::new()),
             origins_by_tenant: RwLock::new(HashMap::new()),
+            dictionaries: RwLock::new(HashMap::new()),
         };
         store.reload_caches().await.unwrap();
 

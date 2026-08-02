@@ -143,32 +143,80 @@ impl EngineRegistry {
             .expect("default language engine is always preloaded")
     }
 
+    /// Return every language code that has both `.aff` and `.dic` files in
+    /// the local cache. Used by `GET /languages` (§27.1).
+    pub fn list_cached_languages(&self) -> Vec<String> {
+        self.dictionary_manager.list_cached_languages()
+    }
+
     /// Cache hit: `O(1)`, no I/O, no lock contention with in-flight loads of
     /// other languages. Cache miss: downloads + parses under `load_lock`,
     /// then caches. Two concurrent misses for the *same* language: the
     /// second blocks on `load_lock` until the first finishes, then its
     /// post-lock re-check finds the entry already cached and returns it
     /// without downloading a second time.
-    pub async fn get_or_load(&self, language: &str) -> Result<Arc<Engine>, EngineError> {
-        if let Some(engine) = self.engines.read().unwrap().get(language) {
-            return Ok(engine.clone());
+    pub async fn get_or_load(
+        &self,
+        language: &str,
+        source_url: Option<&str>,
+    ) -> Result<Arc<Engine>, EngineError> {
+        if source_url.is_none() {
+            if let Some(engine) = self.engines.read().unwrap().get(language) {
+                return Ok(engine.clone());
+            }
         }
 
         let _guard = self.load_lock.lock().await;
 
         // Re-check: another task may have finished loading this language
         // while we were waiting for the lock.
-        if let Some(engine) = self.engines.read().unwrap().get(language) {
-            return Ok(engine.clone());
+        if source_url.is_none() {
+            if let Some(engine) = self.engines.read().unwrap().get(language) {
+                return Ok(engine.clone());
+            }
         }
 
-        let (aff_path, dic_path) = self.dictionary_manager.ensure_dictionary(language).await?;
+        let (aff_path, dic_path) = self
+            .dictionary_manager
+            .ensure_dictionary(language, source_url)
+            .await?;
         let engine = Arc::new(Engine::load_from_paths(&aff_path, &dic_path)?);
         self.engines
             .write()
             .unwrap()
             .insert(language.to_string(), engine.clone());
         Ok(engine)
+    }
+
+    /// Always download and load the language, then replace any existing cached
+    /// engine. Used by `POST /dictionaries` and startup warming so a freshly
+    /// registered source URL is reflected immediately.
+    pub async fn load(
+        &self,
+        language: &str,
+        source_url: Option<&str>,
+    ) -> Result<Arc<Engine>, EngineError> {
+        let _guard = self.load_lock.lock().await;
+        let (aff_path, dic_path) = self
+            .dictionary_manager
+            .ensure_dictionary(language, source_url)
+            .await?;
+        let engine = Arc::new(Engine::load_from_paths(&aff_path, &dic_path)?);
+        self.engines
+            .write()
+            .unwrap()
+            .insert(language.to_string(), engine.clone());
+        Ok(engine)
+    }
+
+    /// Replace the cached engine for a language without removing it. Keeps the
+    /// default-language invariant intact: `default_engine().expect(...)` still
+    /// finds the entry.
+    pub fn replace(&self, language: &str, engine: Engine) {
+        self.engines
+            .write()
+            .unwrap()
+            .insert(language.to_string(), Arc::new(engine));
     }
 }
 
@@ -261,6 +309,8 @@ world
             dictionary_url: "https://example.com/no-such-dictionaries".to_string(),
             dictionary_dir,
             refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
             db_path: std::path::PathBuf::from("/tmp/rustspell-engine-test.db"),
             db_url: None,
             auth_rate_limit_max: 10,
@@ -295,7 +345,7 @@ world
         );
 
         let via_default = registry.default_engine();
-        let via_get_or_load = registry.get_or_load(&config.language).await.unwrap();
+        let via_get_or_load = registry.get_or_load(&config.language, None).await.unwrap();
         assert!(Arc::ptr_eq(&via_default, &via_get_or_load));
     }
 
@@ -311,7 +361,7 @@ world
             dictionary_manager,
         );
 
-        let engine = registry.get_or_load("fr_FR").await.unwrap();
+        let engine = registry.get_or_load("fr_FR", None).await.unwrap();
         assert!(engine.check("bonjour"));
         assert!(!engine.check("hello")); // fr_FR fixture only knows "bonjour"
     }
@@ -327,7 +377,7 @@ world
             dictionary_manager,
         );
 
-        let result = registry.get_or_load("xx_NOPE").await;
+        let result = registry.get_or_load("xx_NOPE", None).await;
         assert!(result.is_err());
     }
 
@@ -346,8 +396,8 @@ world
         let r1 = registry.clone();
         let r2 = registry.clone();
         let (e1, e2) = tokio::join!(
-            tokio::spawn(async move { r1.get_or_load("de_DE").await }),
-            tokio::spawn(async move { r2.get_or_load("de_DE").await }),
+            tokio::spawn(async move { r1.get_or_load("de_DE", None).await }),
+            tokio::spawn(async move { r2.get_or_load("de_DE", None).await }),
         );
         let e1 = e1.unwrap().unwrap();
         let e2 = e2.unwrap().unwrap();

@@ -4,12 +4,13 @@ use std::time::Duration;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    routing::get,
     Router,
 };
 use http_body_util::BodyExt;
 use rustspell_server::{
     auth::RateLimiter,
-    config::Config,
+    config::{Cidr, Config},
     dictionary::DictionaryManager,
     engine::{Engine, EngineRegistry},
     handlers::{self, AppState},
@@ -45,6 +46,8 @@ world
         dictionary_url: "https://example.com".to_string(),
         dictionary_dir: std::path::PathBuf::from("/tmp"),
         refresh_interval_hours: 24,
+        dictionary_admin_cidrs: Vec::new(),
+        trusted_proxies: Vec::new(),
         db_path: std::path::PathBuf::from("/tmp/rustspell-integration.db"),
         db_url: Some("sqlite::memory:".to_string()),
         auth_rate_limit_max: 10,
@@ -127,6 +130,8 @@ world
         dictionary_url: "https://example.com".to_string(),
         dictionary_dir,
         refresh_interval_hours: 24,
+        dictionary_admin_cidrs: Vec::new(),
+        trusted_proxies: Vec::new(),
         db_path: std::path::PathBuf::from("/tmp/rustspell-integration-lang.db"),
         db_url: Some("sqlite::memory:".to_string()),
         auth_rate_limit_max: 10,
@@ -170,6 +175,63 @@ fn write_cached_dictionary_fixture(dictionary_dir: &std::path::Path, language: &
     )
     .unwrap();
     std::fs::write(lang_dir.join(format!("{language}.dic")), "1\nbonjour\n").unwrap();
+}
+
+/// Like `test_app_with_dictionary_dir`, but with configurable admin CIDRs and
+/// trusted proxies for testing `POST /dictionaries` IP gating.
+async fn test_app_with_dictionary_config(
+    dictionary_dir: std::path::PathBuf,
+    dictionary_admin_cidrs: Vec<Cidr>,
+    trusted_proxies: Vec<Cidr>,
+) -> (Router, Arc<Store>, String) {
+    let aff = r"SET UTF-8
+TRY abc
+";
+    let dic = r"2
+hello
+world
+";
+    let engine = Engine::new(aff, dic).unwrap();
+    let config = Config {
+        port: 3000,
+        metrics_port: 9090,
+        log_level: "info".to_string(),
+        language: "en_US".to_string(),
+        dictionary_url: "https://example.com".to_string(),
+        dictionary_dir,
+        refresh_interval_hours: 24,
+        dictionary_admin_cidrs,
+        trusted_proxies,
+        db_path: std::path::PathBuf::from("/tmp/rustspell-integration-cidr.db"),
+        db_url: Some("sqlite::memory:".to_string()),
+        auth_rate_limit_max: 10,
+        auth_rate_limit_window_seconds: 60,
+        auth_rate_limit_cooldown_seconds: 60,
+    };
+    let dictionary_manager = DictionaryManager::new(&config);
+    let engines = Arc::new(EngineRegistry::new(
+        config.language.clone(),
+        engine,
+        dictionary_manager,
+    ));
+    let (store, bootstrap) = Store::open(&config).await.unwrap();
+    let store = Arc::new(store);
+    let platform_key = bootstrap
+        .expect("fresh store bootstraps a platform key")
+        .raw_key;
+    let rate_limiter = Arc::new(RateLimiter::new(
+        config.auth_rate_limit_max,
+        Duration::from_secs(config.auth_rate_limit_window_seconds),
+        Duration::from_secs(config.auth_rate_limit_cooldown_seconds),
+    ));
+    let state = Arc::new(AppState::new(
+        engines,
+        Arc::new(config),
+        store.clone(),
+        rate_limiter,
+        Arc::new(UsageRecorder::new()),
+    ));
+    (handlers::build_app(state), store, platform_key)
 }
 
 async fn body_json(res: axum::response::Response) -> serde_json::Value {
@@ -946,6 +1008,8 @@ async fn openapi_spec_covers_all_public_paths() {
     for route in [
         "/health",
         "/docs",
+        "/languages",
+        "/dictionaries",
         "/spellcheck",
         "/spellcheck/positions",
         "/api-keys",
@@ -978,6 +1042,13 @@ async fn openapi_operations_declare_runtime_status_codes() {
     let operations: Vec<(&str, &str, &str, &[&str])> = vec![
         ("/health", "get", "healthCheck", &["200", "500"]),
         ("/docs", "get", "getOpenApiSpec", &["200", "500"]),
+        ("/languages", "get", "listLanguages", &["200", "500"]),
+        (
+            "/dictionaries",
+            "post",
+            "addDictionary",
+            &["200", "400", "401", "403", "429", "500"],
+        ),
         (
             "/spellcheck",
             "post",
@@ -1587,6 +1658,261 @@ async fn unknown_tenant_id_returns_not_found_on_every_platform_route() {
             "{method} {uri} should 404 for an unknown tenant id"
         );
     }
+}
+
+#[tokio::test]
+async fn languages_requires_no_api_key() {
+    let (app, _store, _platform_key) = test_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/languages")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert!(body["languages"].is_array());
+}
+
+#[tokio::test]
+async fn languages_cors_allows_any_origin() {
+    let (app, _store, _platform_key) = test_app().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/languages")
+                .header("origin", "https://anywhere.example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let allow_origin = response
+        .headers()
+        .get("access-control-allow-origin")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(allow_origin, "https://anywhere.example.com");
+}
+
+#[tokio::test]
+async fn languages_lists_cached_and_registered_dictionaries() {
+    let dir = tempfile::tempdir().unwrap();
+    write_cached_dictionary_fixture(dir.path(), "fr_FR");
+    let (app, store, _platform_key) = test_app_with_dictionary_dir(dir.path().to_path_buf()).await;
+
+    store
+        .register_dictionary("de_DE".to_string(), "https://example.com/de".to_string())
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/languages")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let languages = body["languages"].as_array().unwrap();
+    let fr = languages.iter().find(|l| l["code"] == "fr_FR").unwrap();
+    assert_eq!(fr["cached"], true);
+    assert_eq!(fr["registered"], false);
+
+    let de = languages.iter().find(|l| l["code"] == "de_DE").unwrap();
+    assert_eq!(de["cached"], false);
+    assert_eq!(de["registered"], true);
+}
+
+#[tokio::test]
+async fn add_dictionary_registers_and_warms_language() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store, platform_key) = test_app_with_dictionary_dir(dir.path().to_path_buf()).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dict_app = axum::Router::new()
+        .route("/fr_FR.aff", get(|| async { "SET UTF-8\nTRY abc\n" }))
+        .route("/fr_FR.dic", get(|| async { "1\nbonjour\n" }));
+    tokio::spawn(async move { axum::serve(listener, dict_app).await.unwrap() });
+
+    let source_url = format!("http://{addr}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dictionaries")
+                .header("content-type", "application/json")
+                .header("x-api-key", &platform_key)
+                .body(Body::from(
+                    json!({ "code": "fr_FR", "source_url": source_url }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "fr_FR");
+    assert_eq!(body["source_url"], source_url.clone());
+
+    // Warming made the language available for spell-checking.
+    let (tenant, admin_key) = store
+        .create_tenant("Dict Test".to_string(), None, None, None, None)
+        .await
+        .unwrap();
+    let _ = admin_key;
+    let key = store
+        .create_key(&tenant.id, "std".to_string(), Role::Standard, None)
+        .await
+        .unwrap()
+        .raw_key;
+    let spellcheck_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/spellcheck")
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(Body::from(
+                    json!({ "words": ["bonjour", "hello"], "language": "fr_FR" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spellcheck_response.status(), StatusCode::OK);
+    let results = body_json(spellcheck_response).await;
+    assert_eq!(results["results"][0]["token"], "bonjour");
+    assert_eq!(results["results"][0]["valid"], true);
+}
+
+#[tokio::test]
+async fn add_dictionary_rejects_non_platform_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, store, _platform_key) = test_app_with_dictionary_dir(dir.path().to_path_buf()).await;
+    let standard_key = mint_standard_key(&store).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dictionaries")
+                .header("content-type", "application/json")
+                .header("x-api-key", standard_key)
+                .body(Body::from(
+                    json!({ "code": "fr_FR", "source_url": "https://example.com/fr" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn add_dictionary_rejects_origin_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _store, platform_key) = test_app_with_dictionary_dir(dir.path().to_path_buf()).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dictionaries")
+                .header("content-type", "application/json")
+                .header("x-api-key", platform_key)
+                .header("origin", "https://billing.example.com")
+                .body(Body::from(
+                    json!({ "code": "fr_FR", "source_url": "https://example.com/fr" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn add_dictionary_respects_admin_cidrs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _store, platform_key) = test_app_with_dictionary_config(
+        dir.path().to_path_buf(),
+        vec![Cidr::parse("1.2.3.4/32").unwrap()],
+        Vec::new(),
+    )
+    .await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dictionaries")
+                .header("content-type", "application/json")
+                .header("x-api-key", platform_key)
+                .body(Body::from(
+                    json!({ "code": "fr_FR", "source_url": "https://example.com/fr" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn add_dictionary_resolves_x_forwarded_for_from_trusted_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _store, platform_key) = test_app_with_dictionary_config(
+        dir.path().to_path_buf(),
+        vec![Cidr::parse("127.0.0.1/32").unwrap()],
+        vec![Cidr::parse("0.0.0.0/32").unwrap()],
+    )
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dict_app = axum::Router::new()
+        .route("/fr_FR.aff", get(|| async { "SET UTF-8\nTRY abc\n" }))
+        .route("/fr_FR.dic", get(|| async { "1\nbonjour\n" }));
+    tokio::spawn(async move { axum::serve(listener, dict_app).await.unwrap() });
+
+    let source_url = format!("http://{addr}");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dictionaries")
+                .header("content-type", "application/json")
+                .header("x-api-key", platform_key)
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::from(
+                    json!({ "code": "fr_FR", "source_url": source_url }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---- Usage rollup (DESIGN.md §26) --------------------------------------

@@ -31,7 +31,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Download/load dictionary
     let dict_manager = DictionaryManager::new(&config);
-    let (aff_path, dic_path) = dict_manager.ensure_dictionary(&config.language).await?;
+    let (aff_path, dic_path) = dict_manager
+        .ensure_dictionary(&config.language, None)
+        .await?;
     ::metrics::counter!("dictionary_refresh_total", "result" => "success").increment(1);
     let engine = Engine::load_from_paths(&aff_path, &dic_path)?;
     let engines = EngineRegistry::new(config.language.clone(), engine, dict_manager);
@@ -39,6 +41,17 @@ async fn main() -> anyhow::Result<()> {
     // Open the key/tenant store; print the bootstrap platform key if this is
     // the first start (or the store was emptied of active platform keys).
     let (store, bootstrap_key) = Store::open(&config).await?;
+
+    // Pre-warm every registered dictionary so a bad source URL or parse error
+    // fails startup rather than the first spell-check request (§27.4).
+    for dict in store.list_dictionaries() {
+        tracing::info!(
+            "warming registered dictionary {} from {}",
+            dict.code,
+            dict.source_url
+        );
+        engines.load(&dict.code, Some(&dict.source_url)).await?;
+    }
     if let Some(created) = &bootstrap_key {
         println!(
             "Bootstrap platform API key (save this now, it will not be shown again):\n  {}",

@@ -23,6 +23,8 @@ Provide a production-ready Rust HTTP server that exposes a Hunspell-compatible s
 | F01 | GET | `/health` | Liveness/health check | Returns HTTP 200 with a JSON body indicating status; must not depend on dictionary availability unless explicitly requested. |
 | F02 | GET | `/health?verbose=true` | Health check with metrics | Returns HTTP 200 with status plus basic runtime metrics. |
 | F03 | GET | `/docs` | OpenAPI 3.0 specification | Returns a valid OpenAPI 3.0 JSON document describing all public endpoints. |
+| F03a | GET | `/languages` | List available languages | Public endpoint returning the union of locally cached and registered dictionaries with `cached`/`registered` flags. No API key required. |
+| F03b | POST | `/dictionaries` | Register a dictionary | Platform-key only (plus optional admin CIDR). Persists a language code and source URL template, then downloads/parses/caches the language so it is immediately usable. |
 | F04 | POST | `/spellcheck` | Spell-check a text payload | Accepts a JSON request with `text` and/or `words`, returns one result per token occurrence. |
 | F04a | POST | `/spellcheck/positions` | Spell-check with positions | Same input as `/spellcheck`, but returns unique misspelled tokens with their positions in the input. |
 
@@ -53,6 +55,8 @@ Provide a production-ready Rust HTTP server that exposes a Hunspell-compatible s
 - **F15b** Dictionary refresh interval: configurable via `RUSTSPELL_REFRESH_INTERVAL_HOURS`, default `24`.
 - **F15c** Key/tenant store path: configurable via `RUSTSPELL_DB_PATH` (SQLite, default) or `RUSTSPELL_DB_URL` (PostgreSQL connection string, opt-in — see F33a).
 - **F15d** Auth rate limiting: configurable via `RUSTSPELL_AUTH_RATE_LIMIT_MAX` (default `10`), `RUSTSPELL_AUTH_RATE_LIMIT_WINDOW_SECONDS` (default `60`), `RUSTSPELL_AUTH_RATE_LIMIT_COOLDOWN_SECONDS` (default `60`).
+- **F15e** Dictionary admin CIDR allow-list: `RUSTSPELL_DICTIONARY_ADMIN_CIDRS` (comma-separated, default empty). When set, `POST /dictionaries` is additionally restricted to callers from these networks.
+- **F15f** Trusted proxies: `RUSTSPELL_TRUSTED_PROXIES` (comma-separated CIDR list, default empty). Controls whether `X-Forwarded-For` is consulted when resolving the caller IP for `POST /dictionaries`.
 
 ### 3.5 Observability
 
@@ -67,7 +71,7 @@ Provide a production-ready Rust HTTP server that exposes a Hunspell-compatible s
 
 ### 3.7 Authentication & API Key Management
 
-- **F21** `POST /spellcheck` and `POST /spellcheck/positions` require a valid API key sent via the `X-API-Key` header. `/health`, `/docs`, `/ui`, and `/metrics` remain unauthenticated.
+- **F21** `POST /spellcheck` and `POST /spellcheck/positions` require a valid API key sent via the `X-API-Key` header. `/health`, `/docs`, `/languages`, `/ui`, and `/metrics` remain unauthenticated.
 - **F22** On first start, if the key store is empty, the server generates one bootstrap API key with the `platform` role (see §3.9), prints its raw value once (stdout/log), and persists only its hash. If the store is later emptied (all keys revoked/deleted), the next restart bootstraps a new platform key the same way.
 - **F23** Each key has a role: `platform`, `admin`, or `standard` (see §3.9 for `platform`). `admin` keys may call both spell-check and key-management endpoints *for their own tenant*; `standard` keys may only call spell-check endpoints.
 - **F24** `POST /api-keys` (admin only) creates a key given a required `label`, a `role`, and an optional `expires_at`; the raw key value is returned exactly once in the response body. Only its hash is stored.
@@ -132,6 +136,14 @@ The billing app's usage dashboard needs latency, error, and language history. No
 - **F63** All four endpoints appear in the F03 OpenAPI spec and pass its validation test.
 - **F64** F39's `GET /tenant` is unchanged: it remains the live quota-enforcement counter answering "am I near my cap?", while `/usage/*` is the historical rollup answering "what did I use, when?". The two may legitimately differ by the flush lag.
 
+### 3.11 Language discovery and dictionary registration
+
+- **F65** `GET /languages` is public and unauthenticated. It returns every locale that is either cached on disk or registered in the store, with `cached` and `registered` booleans.
+- **F66** `/languages` is exempt from the per-tenant CORS origin gate so a browser can discover dictionaries before it has a tenant or API key.
+- **F67** `POST /dictionaries` requires a `platform` key. It accepts `code` (validated language code) and `source_url` (http(s) URL template). It persists the pair, then downloads/caches/parses the language immediately.
+- **F68** `RUSTSPELL_DICTIONARY_ADMIN_CIDRS` optionally restricts `POST /dictionaries` to specific source networks. `RUSTSPELL_TRUSTED_PROXIES` optionally enables `X-Forwarded-For` resolution for that IP check.
+- **F69** At startup, every registered dictionary is warmed before the API port is bound. A failure to download or parse any registered dictionary fails startup fast with a descriptive error.
+
 ## 4. Non-Functional Requirements
 
 | ID | Requirement | Target |
@@ -141,7 +153,7 @@ The billing app's usage dashboard needs latency, error, and language history. No
 | NF03 | Sustained throughput | > 1,000 req/s |
 | NF04 | Idle RAM | < 100 MB excluding dictionary |
 | NF05 | Graceful shutdown | Handle SIGINT/SIGTERM; drain in-flight requests |
-| NF06 | Startup failure mode | Fail fast on missing dictionary or invalid config |
+| NF06 | Startup failure mode | Fail fast on missing default dictionary, invalid config, or any registered dictionary that cannot be warmed |
 | NF07 | Platform support | Linux and Windows via Tokio cross-platform signal handling |
 | NF08 | Test coverage | Unit tests for modules, integration tests for endpoints, benchmarks |
 | NF09 | Documentation | OpenAPI spec, README, inline doc comments |
@@ -175,6 +187,9 @@ The billing app's usage dashboard needs latency, error, and language history. No
 - **US20** As an operator, I want usage history to survive deploys so that the dashboard doesn't reset to zero on every release.
 - **US21** As an operator, I want usage storage bounded by a retention window so that the database doesn't grow without limit.
 - **US22** As a dashboard consumer, I want the usage endpoints to return empty arrays rather than errors before data accumulates, so that a fresh install renders an honest empty state instead of a 500.
+- **US23** As a browser-based consumer, I want to discover available languages without an API key so that the UI can list supported dictionaries before I authenticate.
+- **US24** As a platform operator, I want to register a new dictionary source URL and have the server download/cache it immediately so that tenants can use the language without a redeploy.
+- **US25** As a platform operator, I want startup to fail if a registered dictionary source is broken so that runtime spell-check requests don't hit a half-loaded state.
 
 ## 6. Decisions
 
@@ -201,7 +216,12 @@ The billing app's usage dashboard needs latency, error, and language history. No
 | Tenant suspension | Separate `suspended_at` flag from quota exhaustion, so non-payment/ToS actions don't have to be modeled as `quota_limit = 0`. |
 | Origin binding | CORS response headers are necessary but not sufficient: the server also rejects (403) any request carrying an `Origin` header that isn't in the calling key's own tenant's registered origins. Requests without an `Origin` header are exempt. |
 | Platform key + CORS | `platform` keys have no tenant/origins; `/tenants*` rejects any request carrying an `Origin` header outright (403) — server-to-server only, never called from browser JS. |
-| Per-tenant language | Not fixed at tenant creation — `language` is an optional per-request override on `/spellcheck*`, since a single tenant may need multiple dictionaries. |
+| Per-tenant language | Not fixed at tenant creation — `language` is an optional per-request override on `/spellcheck*`, since a single tenant may need multiple dictionaries. Tenant create/update still validate the default language code format. |
+| Language discovery | `GET /languages` is public and unauthenticated; it unions cached files and registered source URLs with `cached`/`registered` flags. |
+| Dictionary registration | `POST /dictionaries` is platform-key only with optional admin CIDR allow-list. Source URLs are persisted in the existing store (`dictionaries` table), not a sidecar file. |
+| Startup warming | All registered dictionaries are warmed before binding ports; a failure fails startup fast. |
+| Trusted-proxy IP resolution | `X-Forwarded-For` is honored for `POST /dictionaries` only when the direct peer is in `RUSTSPELL_TRUSTED_PROXIES`; the chain is walked from right to left to find the first non-trusted client IP. |
+
 | Platform support | Linux and Windows via cross-platform Tokio signal handling. |
 | Error format | RFC 7807 `application/problem+json`. |
 | OpenAPI spec | Hand-written static spec plus a validation test. |

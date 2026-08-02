@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError};
 
-use crate::store::{KeyRecord, OriginInfo, Role, TenantInfo};
+use crate::store::{DictionaryInfo, KeyRecord, OriginInfo, Role, TenantInfo};
 
 /// Request body for spell-check endpoints.
 #[derive(Debug, Deserialize, Validate)]
@@ -147,6 +147,7 @@ pub struct ApiKeyListResponse {
 
 /// Request body for `POST /tenants` (platform key only).
 #[derive(Debug, Deserialize, Validate)]
+#[validate(schema(function = "validate_create_tenant_request"))]
 pub struct CreateTenantRequest {
     #[validate(length(min = 1, max = 200))]
     pub name: String,
@@ -156,10 +157,24 @@ pub struct CreateTenantRequest {
     pub period_end: Option<u64>,
 }
 
+fn validate_create_tenant_request(req: &CreateTenantRequest) -> Result<(), ValidationError> {
+    if let Some(language) = &req.language {
+        if !is_valid_language_code(language) {
+            let mut err = ValidationError::new("invalid_language");
+            err.message = Some(std::borrow::Cow::Borrowed(
+                "language must be 1-20 characters of letters, digits, underscore, or hyphen",
+            ));
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// Request body for `PATCH /tenants/{id}` (platform key only). `period_start`
 /// and `period_end` are tri-state via `Option<Option<u64>>`: an absent field
 /// leaves the value unchanged, `null` clears it, a number sets it.
 #[derive(Debug, Deserialize, Validate)]
+#[validate(schema(function = "validate_update_tenant_request"))]
 pub struct UpdateTenantRequest {
     #[validate(length(min = 1, max = 200))]
     pub name: Option<String>,
@@ -172,6 +187,19 @@ pub struct UpdateTenantRequest {
     pub period_start: Option<Option<u64>>,
     #[serde(default, deserialize_with = "deserialize_present_as_some")]
     pub period_end: Option<Option<u64>>,
+}
+
+fn validate_update_tenant_request(req: &UpdateTenantRequest) -> Result<(), ValidationError> {
+    if let Some(language) = &req.language {
+        if !is_valid_language_code(language) {
+            let mut err = ValidationError::new("invalid_language");
+            err.message = Some(std::borrow::Cow::Borrowed(
+                "language must be 1-20 characters of letters, digits, underscore, or hyphen",
+            ));
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// Plain `Option<Option<T>>` collapses "field present but null" and "field
@@ -280,6 +308,69 @@ impl From<&OriginInfo> for OriginMetadata {
 #[derive(Debug, Serialize)]
 pub struct OriginListResponse {
     pub origins: Vec<OriginMetadata>,
+}
+
+/// Request body for `POST /dictionaries` (platform key + admin CIDR only).
+#[derive(Debug, Deserialize, Validate)]
+#[validate(schema(function = "validate_add_dictionary_request"))]
+pub struct AddDictionaryRequest {
+    pub code: String,
+    pub source_url: String,
+}
+
+fn validate_add_dictionary_request(req: &AddDictionaryRequest) -> Result<(), ValidationError> {
+    if !is_valid_language_code(&req.code) {
+        let mut err = ValidationError::new("invalid_code");
+        err.message = Some(std::borrow::Cow::Borrowed(
+            "code must be 1-20 characters of letters, digits, underscore, or hyphen",
+        ));
+        return Err(err);
+    }
+    let valid_url = req.source_url.parse::<axum::http::Uri>().is_ok_and(|uri| {
+        matches!(uri.scheme_str(), Some("http") | Some("https")) && uri.authority().is_some()
+    });
+    if !valid_url {
+        let mut err = ValidationError::new("invalid_source_url");
+        err.message = Some(std::borrow::Cow::Borrowed(
+            "source_url must be a valid http(s) URL",
+        ));
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Public metadata for one registered dictionary.
+#[derive(Debug, Serialize)]
+pub struct DictionaryMetadata {
+    pub code: String,
+    pub source_url: String,
+    pub created_at: u64,
+}
+
+impl From<&DictionaryInfo> for DictionaryMetadata {
+    fn from(info: &DictionaryInfo) -> Self {
+        Self {
+            code: info.code.clone(),
+            source_url: info.source_url.clone(),
+            created_at: info.created_at,
+        }
+    }
+}
+
+/// One available language as seen by `GET /languages`.
+#[derive(Debug, Serialize)]
+pub struct LanguageInfo {
+    pub code: String,
+    /// Whether the files are already present in the local cache.
+    pub cached: bool,
+    /// Whether the locale is registered in the dictionary store.
+    pub registered: bool,
+}
+
+/// Response for `GET /languages`.
+#[derive(Debug, Serialize)]
+pub struct LanguageListResponse {
+    pub languages: Vec<LanguageInfo>,
 }
 
 /// Optional window shared by every `/usage/*` endpoint. Supplying exactly one
@@ -445,5 +536,57 @@ mod tests {
 
         let set: UpdateTenantRequest = serde_json::from_str(r#"{"period_start": 123}"#).unwrap();
         assert_eq!(set.period_start, Some(Some(123)));
+    }
+
+    #[test]
+    fn create_tenant_request_rejects_malformed_language() {
+        let req = CreateTenantRequest {
+            name: "Acme".to_string(),
+            language: Some("../../etc/passwd".to_string()),
+            quota_limit: None,
+            period_start: None,
+            period_end: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn update_tenant_request_rejects_malformed_language() {
+        let req = UpdateTenantRequest {
+            name: None,
+            language: Some("not valid!".to_string()),
+            quota_limit: None,
+            request_count: None,
+            period_start: None,
+            period_end: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn add_dictionary_request_accepts_valid_code_and_url() {
+        let req = AddDictionaryRequest {
+            code: "fr_FR".to_string(),
+            source_url: "https://example.com/dict".to_string(),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn add_dictionary_request_rejects_invalid_code() {
+        let req = AddDictionaryRequest {
+            code: "../en".to_string(),
+            source_url: "https://example.com/dict".to_string(),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn add_dictionary_request_rejects_non_http_url() {
+        let req = AddDictionaryRequest {
+            code: "fr_FR".to_string(),
+            source_url: "ftp://example.com/dict".to_string(),
+        };
+        assert!(req.validate().is_err());
     }
 }

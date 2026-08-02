@@ -13,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::config::{canonical_ip, Cidr};
 use crate::error::AppError;
 use crate::handlers::AppState;
 use crate::store::{KeyRecord, Role};
@@ -77,6 +78,45 @@ fn client_ip(connect_info: &Option<ConnectInfo<SocketAddr>>) -> IpAddr {
     connect_info
         .map(|ConnectInfo(addr)| addr.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+}
+
+/// Resolve the caller's IP, honoring `X-Forwarded-For` only when the direct
+/// TCP peer is a configured trusted proxy. Walks the forwarded chain from
+/// right to left and returns the first address that is not itself a trusted
+/// proxy; if every hop is trusted, returns the rightmost address. If no
+/// trusted proxy is configured, the direct peer is always used.
+fn resolved_client_ip(
+    peer: IpAddr,
+    trusted_proxies: &[Cidr],
+    x_forwarded_for: Option<&str>,
+) -> IpAddr {
+    if trusted_proxies.is_empty() || !trusted_proxies.iter().any(|c| c.contains(peer)) {
+        return peer;
+    }
+
+    let Some(xff) = x_forwarded_for else {
+        return peer;
+    };
+
+    let mut chain: Vec<IpAddr> = xff
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            entry.parse::<IpAddr>().ok().map(canonical_ip)
+        })
+        .collect();
+
+    while let Some(ip) = chain.pop() {
+        if !trusted_proxies.iter().any(|c| c.contains(ip)) {
+            return ip;
+        }
+    }
+
+    // The whole chain consisted of trusted proxies; fall back to the peer.
+    peer
 }
 
 /// Requires a valid, active `X-API-Key`. On success, inserts the resolved
@@ -181,6 +221,69 @@ pub async fn require_platform_key(
     };
 
     if record.role != Role::Platform {
+        return AppError::Forbidden.into_response();
+    }
+
+    state.store.touch_last_used(&record.id);
+    request.extensions_mut().insert(record);
+    next.run(request).await
+}
+
+/// Gate for `POST /dictionaries`: server-to-server only (no `Origin`),
+/// requires a `platform` key, and optionally restricts the caller to the
+/// configured `dictionary_admin_cidrs`. Respects `X-Forwarded-For` when the
+/// direct peer is in `trusted_proxies` (§27.3).
+pub async fn require_dictionary_admin(
+    State(state): State<Arc<AppState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.headers().contains_key(header::ORIGIN) {
+        return AppError::Forbidden.into_response();
+    }
+
+    let peer = client_ip(&connect_info);
+    let xff = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok());
+    let ip = resolved_client_ip(peer, &state.config.trusted_proxies, xff);
+
+    if let Err(remaining) = state.rate_limiter.check(ip) {
+        return AppError::RateLimited {
+            retry_after_secs: remaining.as_secs().max(1),
+        }
+        .into_response();
+    }
+
+    let raw_key = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let Some(raw_key) = raw_key else {
+        state.rate_limiter.record_failure(ip);
+        return AppError::Unauthorized.into_response();
+    };
+
+    let Some(record) = state.store.authenticate(&raw_key) else {
+        state.rate_limiter.record_failure(ip);
+        return AppError::Unauthorized.into_response();
+    };
+
+    if record.role != Role::Platform {
+        return AppError::Forbidden.into_response();
+    }
+
+    if !state.config.dictionary_admin_cidrs.is_empty()
+        && !state
+            .config
+            .dictionary_admin_cidrs
+            .iter()
+            .any(|c| c.contains(ip))
+    {
         return AppError::Forbidden.into_response();
     }
 

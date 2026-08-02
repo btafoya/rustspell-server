@@ -54,7 +54,9 @@ impl DictionaryManager {
     pub async fn ensure_dictionary(
         &self,
         language: &str,
+        source_url: Option<&str>,
     ) -> Result<(PathBuf, PathBuf), DictionaryError> {
+        let base_url = source_url.unwrap_or(&self.base_url);
         let cache_dir = self.dictionary_dir.join(language);
         let aff_path = cache_dir.join(format!("{language}.aff"));
         let dic_path = cache_dir.join(format!("{language}.dic"));
@@ -65,7 +67,7 @@ impl DictionaryManager {
 
         tracing::info!(
             "dictionary cache missing or stale; downloading {language} from {}",
-            self.base_url
+            base_url
         );
 
         tokio::fs::create_dir_all(&cache_dir)
@@ -75,8 +77,8 @@ impl DictionaryManager {
                 source: e,
             })?;
 
-        let aff_url = format!("{}/{language}.aff", self.base_url);
-        let dic_url = format!("{}/{language}.dic", self.base_url);
+        let aff_url = format!("{base_url}/{language}.aff");
+        let dic_url = format!("{base_url}/{language}.dic");
 
         let aff_data = self.download(&aff_url).await?;
         let dic_data = self.download(&dic_url).await?;
@@ -85,6 +87,31 @@ impl DictionaryManager {
         self.atomic_write(&cache_dir, &dic_path, dic_data).await?;
 
         Ok((aff_path, dic_path))
+    }
+
+    /// Scan the local cache and return every language code that has both an
+    /// `.aff` and a `.dic` file. Used by `GET /languages` (§27.1).
+    pub fn list_cached_languages(&self) -> Vec<String> {
+        let mut codes = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dictionary_dir) else {
+            return codes;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(code) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let aff = path.join(format!("{code}.aff"));
+            let dic = path.join(format!("{code}.dic"));
+            if aff.is_file() && dic.is_file() {
+                codes.push(code.to_string());
+            }
+        }
+        codes.sort();
+        codes
     }
 
     async fn is_fresh(&self, aff_path: &Path, dic_path: &Path) -> bool {
@@ -212,6 +239,8 @@ mod tests {
             dictionary_url: "https://example.com/dict".to_string(),
             dictionary_dir: dict_dir,
             refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
             db_path: PathBuf::from("/tmp/rustspell-dictionary-test.db"),
             db_url: None,
             auth_rate_limit_max: 10,
@@ -229,6 +258,27 @@ mod tests {
         let aff = dir.path().join("en_US.aff");
         let dic = dir.path().join("en_US.dic");
         assert!(!manager.is_fresh(&aff, &dic).await);
+    }
+
+    #[test]
+    fn list_cached_languages_skips_incomplete_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fake_config(dir.path().to_path_buf());
+        let manager = DictionaryManager::new(&config);
+
+        let en_dir = dir.path().join("en_US");
+        std::fs::create_dir_all(&en_dir).unwrap();
+        std::fs::write(en_dir.join("en_US.aff"), "SET UTF-8\n").unwrap();
+        std::fs::write(en_dir.join("en_US.dic"), "1\nhello\n").unwrap();
+
+        let incomplete = dir.path().join("xx_XX");
+        std::fs::create_dir_all(&incomplete).unwrap();
+        std::fs::write(incomplete.join("xx_XX.aff"), "SET UTF-8\n").unwrap();
+        // missing .dic
+
+        let mut codes = manager.list_cached_languages();
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes.pop().unwrap(), "en_US");
     }
 
     #[test]

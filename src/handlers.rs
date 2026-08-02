@@ -28,8 +28,9 @@ use crate::error::{AppError, Result};
 use crate::metrics;
 use crate::middleware;
 use crate::models::{
-    ApiKeyListResponse, ApiKeyMetadata, CreateApiKeyRequest, CreateTenantRequest,
-    CreatedApiKeyResponse, CreatedTenant, DailyUsageResponse, ErrorsResponse, LanguagesResponse,
+    AddDictionaryRequest, ApiKeyListResponse, ApiKeyMetadata, CreateApiKeyRequest,
+    CreateTenantRequest, CreatedApiKeyResponse, CreatedTenant, DailyUsageResponse,
+    DictionaryMetadata, ErrorsResponse, LanguageInfo, LanguageListResponse, LanguagesResponse,
     LatencyResponse, OriginListResponse, OriginMetadata, PositionResult, PositionsResponse,
     RegisterOriginRequest, SpellCheckRequest, SpellCheckResponse, TenantListResponse,
     TenantMetadata, TokenResult, UpdateTenantRequest, UsageQuery,
@@ -106,6 +107,72 @@ pub async fn openapi_docs(State(_state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// `GET /languages`
+///
+/// Public, unauthenticated endpoint returning every language the server can
+/// serve: the union of locally cached dictionaries and registered dictionary
+/// source URLs. The `cached` flag means files exist on disk; `registered` means
+/// a source URL is persisted in the store. A language may be both, either, or
+/// neither if the server has never warmed it.
+pub async fn list_languages(State(state): State<Arc<AppState>>) -> Json<LanguageListResponse> {
+    let mut languages: std::collections::BTreeMap<String, LanguageInfo> =
+        std::collections::BTreeMap::new();
+
+    for code in state.engines.list_cached_languages() {
+        languages.insert(
+            code.clone(),
+            LanguageInfo {
+                code,
+                cached: true,
+                registered: false,
+            },
+        );
+    }
+
+    for info in state.store.list_dictionaries() {
+        let code = info.code;
+        languages
+            .entry(code.clone())
+            .and_modify(|e| e.registered = true)
+            .or_insert(LanguageInfo {
+                code,
+                cached: false,
+                registered: true,
+            });
+    }
+
+    Json(LanguageListResponse {
+        languages: languages.into_values().collect(),
+    })
+}
+
+/// `POST /dictionaries` (platform key + optional admin CIDR only).
+///
+/// Registers a new dictionary source URL, persists it, then downloads/parses
+/// and caches the language so it is immediately available for spell-checking.
+pub async fn add_dictionary(
+    State(state): State<Arc<AppState>>,
+    req: std::result::Result<Json<AddDictionaryRequest>, JsonRejection>,
+) -> Result<Json<DictionaryMetadata>> {
+    let Json(req) = req?;
+    req.validate()
+        .map_err(|e: validator::ValidationErrors| AppError::Validation(e))?;
+
+    let info = state
+        .store
+        .register_dictionary(req.code.clone(), req.source_url.clone())
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    state
+        .engines
+        .load(&req.code, Some(&req.source_url))
+        .await
+        .map_err(|e| AppError::UnsupportedLanguage(e.to_string()))?;
+
+    Ok(Json(DictionaryMetadata::from(&info)))
+}
+
 /// Resolves the engine for a request: the explicit `language` override if
 /// present, otherwise the calling tenant's default language. Downloads and
 /// caches the language on first use if it isn't already loaded (§25);
@@ -135,7 +202,7 @@ async fn resolve_engine(
 
     let engine = state
         .engines
-        .get_or_load(&language)
+        .get_or_load(&language, None)
         .await
         .map_err(|e| AppError::UnsupportedLanguage(e.to_string()))?;
     Ok((engine, language))
@@ -827,6 +894,13 @@ pub fn build_app(state: Arc<AppState>) -> Router {
             auth::require_platform_key,
         ));
 
+    let dictionary_admin_routes = Router::new()
+        .route("/dictionaries", post(add_dictionary))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_dictionary_admin,
+        ));
+
     Router::new()
         .route(
             "/",
@@ -834,12 +908,14 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/health", get(health_check))
         .route("/docs", get(openapi_docs))
+        .route("/languages", get(list_languages))
         .merge(protected_spellcheck)
         .merge(api_key_routes)
         .merge(tenant_self_get)
         .merge(tenant_origin_routes)
         .merge(usage_routes)
         .merge(platform_routes)
+        .merge(dictionary_admin_routes)
         .merge(portal)
         .layer(
             ServiceBuilder::new()
@@ -880,6 +956,8 @@ world
             dictionary_url: "https://example.com".to_string(),
             dictionary_dir: std::path::PathBuf::from("/tmp"),
             refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
             db_path: std::path::PathBuf::from("/tmp/rustspell-handlers-test.db"),
             db_url: Some("sqlite::memory:".to_string()),
             auth_rate_limit_max: 10,

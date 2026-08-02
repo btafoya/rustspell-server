@@ -19,7 +19,14 @@ pub fn cors_layer(store: Arc<Store>) -> CorsLayer {
     CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
         .allow_headers(Any)
-        .allow_origin(AllowOrigin::predicate(move |origin, _request_parts| {
+        .allow_origin(AllowOrigin::predicate(move |origin, request_parts| {
+            // `GET /languages` is intentionally public (§27.1): browsers must
+            // be able to discover available dictionaries before they have a
+            // tenant or API key. Every other path keeps the per-tenant origin
+            // gate.
+            if request_parts.uri.path() == "/languages" {
+                return true;
+            }
             origin
                 .to_str()
                 .map(|s| store.is_registered_origin(s))

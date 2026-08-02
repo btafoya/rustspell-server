@@ -304,6 +304,126 @@
         }
       }
     },
+    "/languages": {
+      "get": {
+        "operationId": "listLanguages",
+        "tags": [
+          "Dictionaries"
+        ],
+        "summary": "List available languages",
+        "description": "Public endpoint returning the union of locally cached dictionaries and registered dictionary source URLs. No API key required.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Available languages",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LanguageListResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dictionaries": {
+      "post": {
+        "operationId": "addDictionary",
+        "tags": [
+          "Dictionaries"
+        ],
+        "summary": "Register a dictionary",
+        "description": "Registers a new dictionary locale and source URL template, persists it, then downloads and caches the `.aff`/`.dic` pair so the language is immediately available. Restricted to `platform` keys and, when configured, callers from `RUSTSPELL_DICTIONARY_ADMIN_CIDRS`.",
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddDictionaryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dictionary registered and warmed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DictionaryMetadata"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error (invalid language code or non-http(s) source URL), or the language could not be downloaded/parsed.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or revoked key",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Key is not `platform`, request carries an `Origin` header, or caller IP is outside the configured admin CIDRs",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many failed authentication attempts from this IP",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "operationId": "healthCheck",
@@ -1508,6 +1628,7 @@
           "language": {
             "type": "string",
             "nullable": true,
+            "pattern": "^[A-Za-z0-9_-]{1,20}$",
             "description": "Defaults to en_US if omitted."
           },
           "quota_limit": {
@@ -1703,6 +1824,80 @@
             "items": {
               "$ref": "#/components/schemas/LanguageDistribution"
             }
+          }
+        }
+      },
+      "LanguageInfo": {
+        "type": "object",
+        "required": [
+          "code",
+          "cached",
+          "registered"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "en_US"
+          },
+          "cached": {
+            "type": "boolean",
+            "description": "Whether the `.aff`/`.dic` files are present in the local cache."
+          },
+          "registered": {
+            "type": "boolean",
+            "description": "Whether a source URL template is persisted for this locale."
+          }
+        }
+      },
+      "LanguageListResponse": {
+        "type": "object",
+        "required": [
+          "languages"
+        ],
+        "properties": {
+          "languages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LanguageInfo"
+            }
+          }
+        }
+      },
+      "AddDictionaryRequest": {
+        "type": "object",
+        "required": [
+          "code",
+          "source_url"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,20}$",
+            "description": "Locale code used as the cache directory name and substituted into the source URL template."
+          },
+          "source_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Base URL template from which `{code}.aff` and `{code}.dic` are downloaded. Must be http(s)."
+          }
+        }
+      },
+      "DictionaryMetadata": {
+        "type": "object",
+        "required": [
+          "code",
+          "source_url",
+          "created_at"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
           }
         }
       },
@@ -1987,7 +2182,8 @@
             "maxLength": 200
           },
           "language": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,20}$"
           },
           "quota_limit": {
             "type": "integer"
