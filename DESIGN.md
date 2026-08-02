@@ -558,12 +558,14 @@ New bootstrap platform API key (save this now, it will not be shown again):
 3. If `--yes` is not set, prompt `This will invalidate the existing bootstrap platform key and issue a new one. Continue? [y/N] ` on stderr and read from stdin. Only `y` or `yes` (case-insensitive) proceeds.
 4. Call `Store::reset_bootstrap_platform_key()`:
    - Find all active (not revoked, not expired) `platform`-role keys with label `"bootstrap"`.
-   - If exactly one exists, rotate it in place: generate a new raw value, update the `key_hash` column, reset `last_used_at` to `NULL`, and update the in-memory key cache so the old hash is removed and the new hash is inserted. Keep the same `id`, `label`, `role`, `created_at`, `expires_at`, and `revoked_at`.
+   - If exactly one exists, rotate it in place: generate a new raw value, update the `key_hash` column, reset `last_used_at` to `NULL`, and update the in-memory key cache of the CLI process so the old hash is removed and the new hash is inserted. Keep the same `id`, `label`, `role`, `created_at`, `expires_at`, and `revoked_at`.
    - If none exists, create one with `tenant_id = NULL`, `label = "bootstrap"`, `role = Platform`, no expiry.
    - If more than one exists, return an error without mutating any key (prevents ambiguous resets).
 5. Print the new raw key using the selected output mode.
 6. If `RUSTSPELL_BOOTSTRAP_SECRETS_PATH` is set, write the same JSON shape the startup path writes (`{"platform_key":"..."}`) to that path. A failure to write this file is a hard error (non-zero exit) because the operator explicitly configured the path.
 7. Exit 0.
+
+A running server process does **not** need to be restarted. Its `Store::authenticate` hot path checks the in-memory key cache first; on a miss, it queries the database, and when it finds the rotated key it inserts the new hash into the cache and evicts any stale hash for the same key id. The old raw value therefore stops authenticating as soon as the new value is first used.
 
 ### 16.5 Store additions
 
@@ -595,6 +597,7 @@ impl Store {
 |------|------|
 | Unit | `store.rs`: `reset_bootstrap_platform_key` creates a key on empty store, rotates a single existing bootstrap key, rejects two active bootstrap keys, and invalidates the old raw value. |
 | Unit | `store.rs`: file-backed close/reopen test proves a rotated bootstrap key is loadable after `Store::open_for_cli` (then `Store::open`) reloads it. |
+| Unit | `store.rs`: a running `Store` honors a key rotated by a second `Store` on the same database via the DB fallback path, and evicts the stale hash once the new value is used. |
 | Unit | `cli.rs`: argument parsing rejects `--json --quiet`, requires `--yes` or TTY, and selects the correct output formatter. |
 | Integration | Run the CLI binary subcommand against a temporary SQLite file and verify the printed key authenticates as `platform` on the next server start. |
 

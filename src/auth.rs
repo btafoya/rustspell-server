@@ -152,7 +152,7 @@ pub async fn require_active_key(
         return AppError::Unauthorized.into_response();
     };
 
-    let Some(record) = state.store.authenticate(&raw_key) else {
+    let Some(record) = state.store.authenticate(&raw_key).await else {
         state.rate_limiter.record_failure(ip);
         return AppError::Unauthorized.into_response();
     };
@@ -215,7 +215,7 @@ pub async fn require_platform_key(
         return AppError::Unauthorized.into_response();
     };
 
-    let Some(record) = state.store.authenticate(&raw_key) else {
+    let Some(record) = state.store.authenticate(&raw_key).await else {
         state.rate_limiter.record_failure(ip);
         return AppError::Unauthorized.into_response();
     };
@@ -268,7 +268,7 @@ pub async fn require_dictionary_admin(
         return AppError::Unauthorized.into_response();
     };
 
-    let Some(record) = state.store.authenticate(&raw_key) else {
+    let Some(record) = state.store.authenticate(&raw_key).await else {
         state.rate_limiter.record_failure(ip);
         return AppError::Unauthorized.into_response();
     };

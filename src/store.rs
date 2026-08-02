@@ -427,16 +427,49 @@ impl Store {
         Ok(CreatedApiKey { record, raw_key })
     }
 
-    /// Hot-path lookup: hash the raw key, check the cache, verify active. No I/O.
-    pub fn authenticate(&self, raw_key: &str) -> Option<KeyRecord> {
+    /// Hot-path lookup: hash the raw key, check the cache, verify active. If the
+    /// cache misses, fall back to a database query so rotations performed by an
+    /// offline CLI process (or any other out-of-process change) are honored by
+    /// a running server without requiring a restart.
+    pub async fn authenticate(&self, raw_key: &str) -> Option<KeyRecord> {
         let hash = hash_key(raw_key);
         let now = now();
-        self.keys
-            .read()
-            .unwrap()
-            .get(&hash)
-            .filter(|k| k.is_active(now))
-            .cloned()
+
+        {
+            let keys = self.keys.read().unwrap();
+            if let Some(record) = keys.get(&hash).filter(|k| k.is_active(now)) {
+                return Some(record.clone());
+            }
+        }
+
+        let record = self.load_key_by_hash(&hash).await.ok()??;
+        if !record.is_active(now) {
+            return None;
+        }
+
+        let mut keys = self.keys.write().unwrap();
+        // Rotations performed by another process change the key_hash for an
+        // existing id. Remove any stale hash for this id so the old value stops
+        // authenticating as soon as the new value is used.
+        keys.retain(|_, k| k.id != record.id);
+        keys.insert(hash, record.clone());
+        Some(record)
+    }
+
+    async fn load_key_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<KeyRecord>> {
+        let row = sqlx::query(
+            "SELECT id, COALESCE(tenant_id, '') AS tenant_id, label, role, key_hash, created_at, \
+             COALESCE(expires_at, -1) AS expires_at, COALESCE(last_used_at, -1) AS last_used_at, \
+             COALESCE(revoked_at, -1) AS revoked_at FROM api_keys WHERE key_hash = ?",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(key_record_from_row(&row)?)),
+            None => Ok(None),
+        }
     }
 
     /// Fire-and-forget: updates the cache synchronously (so an immediately
@@ -1207,7 +1240,7 @@ mod tests {
         let key = bootstrap.expect("empty store should bootstrap a platform key");
         assert_eq!(key.record.role, Role::Platform);
         assert!(key.record.tenant_id.is_none());
-        assert!(store.authenticate(&key.raw_key).is_some());
+        assert!(store.authenticate(&key.raw_key).await.is_some());
     }
 
     #[tokio::test]
@@ -1222,14 +1255,14 @@ mod tests {
             .create_key(&tenant.id, "ci".to_string(), Role::Standard, None)
             .await
             .unwrap();
-        assert!(store.authenticate(&created.raw_key).is_some());
+        assert!(store.authenticate(&created.raw_key).await.is_some());
 
         let revoked = store
             .revoke_key(&tenant.id, &created.record.id)
             .await
             .unwrap();
         assert!(revoked);
-        assert!(store.authenticate(&created.raw_key).is_none());
+        assert!(store.authenticate(&created.raw_key).await.is_none());
     }
 
     #[tokio::test]
@@ -1254,8 +1287,8 @@ mod tests {
         assert_eq!(rotated.record.id, created.record.id);
         assert_eq!(rotated.record.label, created.record.label);
         assert_eq!(rotated.record.role, created.record.role);
-        assert!(store.authenticate(&created.raw_key).is_none());
-        assert!(store.authenticate(&rotated.raw_key).is_some());
+        assert!(store.authenticate(&created.raw_key).await.is_none());
+        assert!(store.authenticate(&rotated.raw_key).await.is_some());
     }
 
     #[tokio::test]
@@ -1294,7 +1327,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.authenticate(&created.raw_key).is_none());
+        assert!(store.authenticate(&created.raw_key).await.is_none());
     }
 
     #[tokio::test]
@@ -1337,7 +1370,7 @@ mod tests {
             "existing active platform key should not re-bootstrap"
         );
         assert!(store.get_tenant(&tenant_id).is_some());
-        assert!(store.authenticate(&raw_key).is_some());
+        assert!(store.authenticate(&raw_key).await.is_some());
     }
 
     /// Usage rows must survive a real restart, not just live in the cache —
@@ -1599,7 +1632,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result);
-        assert!(store.authenticate(&key_a.raw_key).is_some());
+        assert!(store.authenticate(&key_a.raw_key).await.is_some());
 
         store
             .register_origin(&tenant_a.id, "https://a.example.com".to_string())
@@ -1724,14 +1757,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tenant.quota_limit, 0);
-        assert!(store.authenticate(&admin_key.raw_key).is_some());
+        assert!(store.authenticate(&admin_key.raw_key).await.is_some());
 
         let revoked = store
             .revoke_key(&tenant.id, &admin_key.record.id)
             .await
             .unwrap();
         assert!(revoked);
-        assert!(store.authenticate(&admin_key.raw_key).is_none());
+        assert!(store.authenticate(&admin_key.raw_key).await.is_none());
     }
 
     #[tokio::test]
@@ -1835,13 +1868,13 @@ mod tests {
             .cloned()
             .unwrap();
         store.revoke_key("", &bootstrap.id).await.unwrap();
-        assert!(store.authenticate("not-the-key").is_none());
+        assert!(store.authenticate("not-the-key").await.is_none());
 
         let reset = store.reset_bootstrap_platform_key().await.unwrap();
         assert_eq!(reset.record.role, Role::Platform);
         assert!(reset.record.tenant_id.is_none());
         assert_eq!(reset.record.label, "bootstrap");
-        assert!(store.authenticate(&reset.raw_key).is_some());
+        assert!(store.authenticate(&reset.raw_key).await.is_some());
     }
 
     #[tokio::test]
@@ -1855,8 +1888,8 @@ mod tests {
         assert_eq!(reset.record.role, Role::Platform);
         assert_ne!(reset.raw_key, original.raw_key);
 
-        assert!(store.authenticate("not-the-key").is_none());
-        assert!(store.authenticate(&reset.raw_key).is_some());
+        assert!(store.authenticate(&original.raw_key).await.is_none());
+        assert!(store.authenticate(&reset.raw_key).await.is_some());
     }
 
     #[tokio::test]
@@ -1906,8 +1939,50 @@ mod tests {
 
         let (store, _bootstrap) = Store::open(&config).await.unwrap();
         assert!(
-            store.authenticate(&raw_key).is_some(),
+            store.authenticate(&raw_key).await.is_some(),
             "rotated bootstrap key must be loadable after a file-backed restart"
         );
+    }
+
+    /// A running server process must honor a platform-key rotation performed by
+    /// a separate CLI process against the same database. The server's in-memory
+    /// cache is stale after the rotation, so `authenticate` must fall back to the
+    /// database on cache miss instead of returning 401.
+    #[tokio::test]
+    async fn authenticate_falls_back_to_db_after_external_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            port: 3000,
+            metrics_port: 9090,
+            log_level: "info".to_string(),
+            language: "en_US".to_string(),
+            dictionary_url: "https://example.com".to_string(),
+            dictionary_dir: dir.path().to_path_buf(),
+            refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
+            db_path: dir.path().join("stale-cache.db"),
+            db_url: None,
+            auth_rate_limit_max: 10,
+            auth_rate_limit_window_seconds: 60,
+            auth_rate_limit_cooldown_seconds: 60,
+        };
+
+        let (server_store, bootstrap) = Store::open(&config).await.unwrap();
+        let original = bootstrap.expect("empty store should bootstrap a platform key");
+
+        // A second Store on the same file simulates the offline CLI process.
+        let cli_store = Store::open_for_cli(&config).await.unwrap();
+        let rotated = cli_store
+            .reset_bootstrap_platform_key()
+            .await
+            .expect("single bootstrap key should rotate cleanly");
+
+        // The new key is not in the running server's in-memory cache, so it is
+        // found via the DB fallback path.
+        assert!(server_store.authenticate(&rotated.raw_key).await.is_some());
+        // Once the new value is cached, the stale hash for the same id is
+        // evicted and the old key stops working.
+        assert!(server_store.authenticate(&original.raw_key).await.is_none());
     }
 }
