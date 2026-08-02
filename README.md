@@ -181,11 +181,19 @@ The file is only written when a new platform key is bootstrapped, and contains:
 ### Resetting the Bootstrap Key
 
 If the bootstrap platform key is lost or compromised, run the offline
-`reset-platform-key` subcommand against the same store. With Docker Compose,
-stop the server container first, then:
+`reset-platform-key` subcommand against the same store. Stop the running
+server container first, then:
+
+**Docker Compose**
 
 ```bash
 docker compose run --rm rustspell reset-platform-key --yes
+```
+
+**Plain Docker**
+
+```bash
+docker run --rm -v rustspell-data:/data rustspell-server reset-platform-key --yes
 ```
 
 This rotates the existing `bootstrap` platform key in place (same id/label,
