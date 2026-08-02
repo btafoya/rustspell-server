@@ -33,7 +33,7 @@ The server is a single Tokio binary with two TCP listeners: the public API on `R
 
 | Module | Responsibility |
 |--------|----------------|
-| `src/main.rs` | Bootstrap: init tracing, config, dictionary manager, metrics server, API router, graceful shutdown. |
+| `src/main.rs` | Bootstrap: init tracing, config, dictionary manager, metrics server, API router, graceful shutdown; also dispatches to the CLI subcommand when invoked as `reset-platform-key`. |
 | `src/config.rs` | Load and validate environment configuration. |
 | `src/error.rs` | Application error type mapped to RFC 7807 Problem Details responses. |
 | `src/models.rs` | Serde request/response structs and `validator` constraints. |
@@ -47,6 +47,7 @@ The server is a single Tokio binary with two TCP listeners: the public API on `R
 | `src/store.rs` | Pluggable persistence layer (SQLite or PostgreSQL, §20): keys, tenants, and registered origins, plus in-memory read caches for the auth/CORS hot path. Renamed and broadened from the single-tenant design's `keystore.rs` (§17) — see §20 for why. |
 | `src/auth.rs` | Axum middleware: `X-API-Key` extraction/validation, role gates (`platform`/`admin`/`standard`), origin binding (§23), quota enforcement (§24), dictionary-admin IP gate with `X-Forwarded-For` resolution (§27.3), and per-IP auth-failure rate limiting. |
 | `src/usage.rs` | Usage rollup recorder (§26): in-memory accumulation buffer, latency bucket ladder, percentile interpolation, and the scope/window resolution shared by the four `/usage/*` handlers. All SQL stays in `store.rs`. |
+| `src/cli.rs` | Offline bootstrap platform-key reset command (§16): argument parsing, confirmation prompt, output formatting, and secrets-file writing. |
 | `benches/spellcheck_bench.rs` | Criterion benchmarks for `/spellcheck` throughput. |
 
 ### 2.1 Dependency changes
@@ -519,8 +520,96 @@ Use `tower::ServiceExt::oneshot` for integration tests to avoid binding real por
 7. **Tests + Benchmarks**: unit tests, integration tests, `benches/spellcheck_bench.rs`.
 8. **Deployment**: Dockerfile, docker-compose.yml, README updates.
 9. **Usage Rollup** (§26): add `usage_daily`/`usage_latency` tables and flush/query/purge methods to `store.rs`; create `usage.rs` (buffer, bucket ladder, percentiles); add the `record_usage` and `require_usage_scope` middleware and the four `/usage/*` handlers; add `AppError::InvalidDateRange` plus its `docs/errors/` page; spawn flush and purge tasks in `main.rs` and flush on shutdown; update `openapi.json`.
+10. **Bootstrap Key Reset CLI** (§16): add `src/cli.rs`, `Store::open_for_cli`, `Store::reset_bootstrap_platform_key`, early subcommand dispatch in `main.rs`, unit/integration tests, and README usage examples.
 
-## 16. Risks and Notes
+## 16. Bootstrap Platform Key Reset CLI (`src/cli.rs`)
+
+### 16.1 Overview
+
+A small offline administrative command invoked as a subcommand of the same server binary. It exists because the bootstrap `platform` key printed at first start is shown exactly once; if it is lost or compromised, the operator needs a host-level escape hatch that does not require redeploying or hand-editing the SQLite/Postgres store.
+
+### 16.2 Command dispatch
+
+`main.rs` inspects `std::env::args()` before initializing tracing, dictionaries, metrics, or HTTP listeners. If the first positional argument is `reset-platform-key`, control passes to `src/cli.rs::run()` and the server bootstrap path is skipped entirely. Any other invocation (including no arguments) runs the API server as before. This keeps the command packaged in the same container image and lets `docker compose run --rm rustspell reset-platform-key` work without changing `docker-compose.yml`, `Dockerfile`, or adding a wrapper script.
+
+### 16.3 CLI surface
+
+```
+rustspell-server reset-platform-key [--yes] [--json | --quiet]
+```
+
+- `--yes`: skip the interactive confirmation prompt. Required in non-TTY environments; otherwise the command fails with a clear error.
+- `--json`: print only `{"platform_key":"<raw value>"}\n` to stdout.
+- `--quiet`: print only the raw key value followed by a newline to stdout.
+- The flags are mutually exclusive.
+- No other positional arguments are accepted; unknown arguments produce a non-zero exit and a usage message on stderr.
+
+Default (human-readable) output mirrors the startup bootstrap message:
+
+```
+New bootstrap platform API key (save this now, it will not be shown again):
+  <raw value>
+```
+
+### 16.4 Lifecycle and side effects
+
+1. Load configuration with the existing `config::load()` so `RUSTSPELL_DB_PATH` / `RUSTSPELL_DB_URL` are honored without new environment variables.
+2. Open the store via a new `Store::open_for_cli(config)` method. It connects to SQLite/Postgres, runs schema initialization, and reloads in-memory caches, but it does **not** warm dictionaries, start HTTP/metrics servers, spawn usage tasks, or bootstrap a new platform key.
+3. If `--yes` is not set, prompt `This will invalidate the existing bootstrap platform key and issue a new one. Continue? [y/N] ` on stderr and read from stdin. Only `y` or `yes` (case-insensitive) proceeds.
+4. Call `Store::reset_bootstrap_platform_key()`:
+   - Find all active (not revoked, not expired) `platform`-role keys with label `"bootstrap"`.
+   - If exactly one exists, rotate it in place: generate a new raw value, update the `key_hash` column, reset `last_used_at` to `NULL`, and update the in-memory key cache so the old hash is removed and the new hash is inserted. Keep the same `id`, `label`, `role`, `created_at`, `expires_at`, and `revoked_at`.
+   - If none exists, create one with `tenant_id = NULL`, `label = "bootstrap"`, `role = Platform`, no expiry.
+   - If more than one exists, return an error without mutating any key (prevents ambiguous resets).
+5. Print the new raw key using the selected output mode.
+6. If `RUSTSPELL_BOOTSTRAP_SECRETS_PATH` is set, write the same JSON shape the startup path writes (`{"platform_key":"..."}`) to that path. A failure to write this file is a hard error (non-zero exit) because the operator explicitly configured the path.
+7. Exit 0.
+
+### 16.5 Store additions
+
+Two new public methods on `Store`:
+
+```rust
+impl Store {
+    /// Open the store for offline administrative commands.
+    /// Same as `Store::open` minus bootstrap-key creation and server runtime setup.
+    pub async fn open_for_cli(config: &Config) -> anyhow::Result<Self>;
+
+    /// Reset (rotate-or-create) the single bootstrap platform key.
+    /// Idempotent-ish: safe to run when a bootstrap key already exists.
+    pub async fn reset_bootstrap_platform_key(&self) -> anyhow::Result<CreatedApiKey>;
+}
+```
+
+`reset_bootstrap_platform_key` reuses existing internal helpers (`generate_raw_key`, `hash_key`, key-cache update pattern from `rotate_key`) but bypasses the tenant-scoped `rotate_key` check because bootstrap keys have `tenant_id = NULL`.
+
+### 16.6 Error behavior
+
+- Any I/O, SQL, or ambiguous-key error produces a non-zero exit code and a descriptive message on stderr.
+- In human-readable mode, the new key is never printed if the reset fails.
+- `--json`/`--quiet` still emit nothing to stdout on failure; all diagnostics go to stderr.
+
+### 16.7 Testing
+
+| Type | Test |
+|------|------|
+| Unit | `store.rs`: `reset_bootstrap_platform_key` creates a key on empty store, rotates a single existing bootstrap key, rejects two active bootstrap keys, and invalidates the old raw value. |
+| Unit | `store.rs`: file-backed close/reopen test proves a rotated bootstrap key is loadable after `Store::open_for_cli` (then `Store::open`) reloads it. |
+| Unit | `cli.rs`: argument parsing rejects `--json --quiet`, requires `--yes` or TTY, and selects the correct output formatter. |
+| Integration | Run the CLI binary subcommand against a temporary SQLite file and verify the printed key authenticates as `platform` on the next server start. |
+
+### 16.8 Documentation
+
+- Update `README.md` with the `docker compose run --rm rustspell reset-platform-key` example.
+- No OpenAPI change (there is no HTTP endpoint).
+
+### 16.9 Security notes
+
+- The CLI relies on host/container filesystem access as the authorization proof. Anyone who can run a container with the `data` volume mounted can reset the bootstrap key. This is the same trust boundary as editing `rustspell.db` directly.
+- Interactive confirmation and the `--yes` flag follow the destructive-operation convention.
+- The raw key is printed exactly once and, if configured, written to the secrets file. It is not logged.
+
+## 17. Risks and Notes
 
 - **Tokenizer**: `spellbook` has no public tokenizer; use a project-local fallback tokenizer.
 - **Dictionary URLs**: LibreOffice extension URLs are versioned in the filename. A default URL is provided, but operators may need to override it for newer releases.
@@ -1048,7 +1137,7 @@ Doing this in middleware rather than at the end of each handler is deliberate: t
 
 ### 26.4 Buffering and flush
 
-Writing a row per request would put a serialized SQLite `UPSERT` on the hot path — the ceiling §16 already flags for `last_used_at` and `request_count`, but worse, because this write is an aggregate read-modify-write. So `UsageRecorder` accumulates in memory and a background task flushes:
+Writing a row per request would put a serialized SQLite `UPSERT` on the hot path — the ceiling §17 already flags for `last_used_at` and `request_count`, but worse, because this write is an aggregate read-modify-write. So `UsageRecorder` accumulates in memory and a background task flushes:
 
 ```rust
 pub struct UsageRecorder {

@@ -97,6 +97,7 @@ pub struct DictionaryInfo {
 }
 
 /// A freshly generated key: the raw value is only ever available here, once.
+#[derive(Debug)]
 pub struct CreatedApiKey {
     pub record: KeyRecord,
     pub raw_key: String,
@@ -117,6 +118,29 @@ impl Store {
     /// Connects, initializes the schema, loads the caches, and — if no active
     /// `platform` key exists — bootstraps one (F22).
     pub async fn open(config: &Config) -> anyhow::Result<(Self, Option<CreatedApiKey>)> {
+        let store = Self::open_internal(config).await?;
+
+        let bootstrap = if !store.has_active_platform_key() {
+            Some(
+                store
+                    .create_key_internal(None, "bootstrap".to_string(), Role::Platform, None)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok((store, bootstrap))
+    }
+
+    /// Same as [`Store::open`] minus bootstrap-key creation. Intended for
+    /// offline administrative commands that must not warm dictionaries or
+    /// start server runtime.
+    pub async fn open_for_cli(config: &Config) -> anyhow::Result<Self> {
+        Self::open_internal(config).await
+    }
+
+    async fn open_internal(config: &Config) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
 
         let url = match &config.db_url {
@@ -157,17 +181,7 @@ impl Store {
 
         store.reload_caches().await?;
 
-        let bootstrap = if !store.has_active_platform_key() {
-            Some(
-                store
-                    .create_key_internal(None, "bootstrap".to_string(), Role::Platform, None)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        Ok((store, bootstrap))
+        Ok(store)
     }
 
     async fn reload_caches(&self) -> anyhow::Result<()> {
@@ -357,6 +371,44 @@ impl Store {
             }
         };
 
+        self.rotate_key_by_hash(&old_hash, id).await.map(Some)
+    }
+
+    /// Rotate the bootstrap `platform` key (no tenant), or create one if none
+    /// exists. Fails if more than one active bootstrap key is present so the
+    /// operation is unambiguous.
+    pub async fn reset_bootstrap_platform_key(&self) -> anyhow::Result<CreatedApiKey> {
+        let now = now();
+        let bootstrap_records: Vec<KeyRecord> = {
+            let keys = self.keys.read().unwrap();
+            keys.values()
+                .filter(|k| {
+                    k.role == Role::Platform
+                        && k.label == "bootstrap"
+                        && k.tenant_id.is_none()
+                        && k.is_active(now)
+                })
+                .cloned()
+                .collect()
+        };
+
+        match bootstrap_records.len() {
+            0 => {
+                self.create_key_internal(None, "bootstrap".to_string(), Role::Platform, None)
+                    .await
+            }
+            1 => {
+                let record = &bootstrap_records[0];
+                self.rotate_key_by_hash(&record.key_hash, &record.id).await
+            }
+            _ => anyhow::bail!(
+                "found {} active platform keys labeled 'bootstrap'; reset is ambiguous",
+                bootstrap_records.len()
+            ),
+        }
+    }
+
+    async fn rotate_key_by_hash(&self, old_hash: &str, id: &str) -> anyhow::Result<CreatedApiKey> {
         let raw_key = generate_raw_key();
         let new_hash = hash_key(&raw_key);
 
@@ -367,12 +419,12 @@ impl Store {
             .await?;
 
         let mut keys = self.keys.write().unwrap();
-        let mut record = keys.remove(&old_hash).expect("checked above");
+        let mut record = keys.remove(old_hash).expect("checked above");
         record.key_hash = new_hash.clone();
         record.last_used_at = None;
         keys.insert(new_hash, record.clone());
 
-        Ok(Some(CreatedApiKey { record, raw_key }))
+        Ok(CreatedApiKey { record, raw_key })
     }
 
     /// Hot-path lookup: hash the raw key, check the cache, verify active. No I/O.
@@ -1766,6 +1818,96 @@ mod tests {
         assert_eq!(
             successes, 10,
             "exactly quota_limit requests should succeed, no overshoot"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_bootstrap_platform_key_creates_on_empty_store() {
+        let (store, _bootstrap) = open_test_store().await;
+        // Simulate an empty store with no active platform key by revoking the
+        // bootstrap key created by `open_test_store`.
+        let bootstrap = store
+            .keys
+            .read()
+            .unwrap()
+            .values()
+            .find(|k| k.role == Role::Platform)
+            .cloned()
+            .unwrap();
+        store.revoke_key("", &bootstrap.id).await.unwrap();
+        assert!(store.authenticate("not-the-key").is_none());
+
+        let reset = store.reset_bootstrap_platform_key().await.unwrap();
+        assert_eq!(reset.record.role, Role::Platform);
+        assert!(reset.record.tenant_id.is_none());
+        assert_eq!(reset.record.label, "bootstrap");
+        assert!(store.authenticate(&reset.raw_key).is_some());
+    }
+
+    #[tokio::test]
+    async fn reset_bootstrap_platform_key_rotates_single_key() {
+        let (store, bootstrap) = open_test_store().await;
+        let original = bootstrap.expect("bootstrap key should exist");
+
+        let reset = store.reset_bootstrap_platform_key().await.unwrap();
+        assert_eq!(reset.record.id, original.record.id);
+        assert_eq!(reset.record.label, original.record.label);
+        assert_eq!(reset.record.role, Role::Platform);
+        assert_ne!(reset.raw_key, original.raw_key);
+
+        assert!(store.authenticate("not-the-key").is_none());
+        assert!(store.authenticate(&reset.raw_key).is_some());
+    }
+
+    #[tokio::test]
+    async fn reset_bootstrap_platform_key_rejects_ambiguous_keys() {
+        let (store, _bootstrap) = open_test_store().await;
+        // Create a second active bootstrap key to trigger the ambiguity guard.
+        store
+            .create_key_internal(None, "bootstrap".to_string(), Role::Platform, None)
+            .await
+            .unwrap();
+
+        let err = store
+            .reset_bootstrap_platform_key()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    /// The CLI reset must survive a real file-backed restart, not just the
+    /// in-memory cache — `:memory:` never exercises the reload-from-disk path.
+    #[tokio::test]
+    async fn reset_bootstrap_platform_key_survives_file_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            port: 3000,
+            metrics_port: 9090,
+            log_level: "info".to_string(),
+            language: "en_US".to_string(),
+            dictionary_url: "https://example.com".to_string(),
+            dictionary_dir: dir.path().to_path_buf(),
+            refresh_interval_hours: 24,
+            dictionary_admin_cidrs: Vec::new(),
+            trusted_proxies: Vec::new(),
+            db_path: dir.path().join("bootstrap.db"),
+            db_url: None,
+            auth_rate_limit_max: 10,
+            auth_rate_limit_window_seconds: 60,
+            auth_rate_limit_cooldown_seconds: 60,
+        };
+
+        let raw_key = {
+            let store = Store::open_for_cli(&config).await.unwrap();
+            let created = store.reset_bootstrap_platform_key().await.unwrap();
+            created.raw_key
+        };
+
+        let (store, _bootstrap) = Store::open(&config).await.unwrap();
+        assert!(
+            store.authenticate(&raw_key).is_some(),
+            "rotated bootstrap key must be loadable after a file-backed restart"
         );
     }
 }

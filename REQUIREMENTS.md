@@ -144,6 +144,24 @@ The billing app's usage dashboard needs latency, error, and language history. No
 - **F68** `RUSTSPELL_DICTIONARY_ADMIN_CIDRS` optionally restricts `POST /dictionaries` to specific source networks. `RUSTSPELL_TRUSTED_PROXIES` optionally enables `X-Forwarded-For` resolution for that IP check.
 - **F69** At startup, every registered dictionary is warmed before the API port is bound. A failure to download or parse any registered dictionary fails startup fast with a descriptive error.
 
+### 3.12 Bootstrap Platform Key Reset (CLI)
+
+This section adds an operator escape hatch for the `platform` bootstrap key defined in F22. It is intended for the case where the bootstrap key printed on first start has been lost or compromised and the operator needs a new one without redeploying or manually editing the database.
+
+- **F70** A CLI command named `reset-platform-key`, packaged in the same container image as the server, shall reset the active bootstrap platform key. "Reset" means rotate the key in place: same id and `label` (`"bootstrap"`), same `platform` role, new cryptographically secure raw value, and the old raw value invalidated.
+- **F70a** The command shall use the same persistence backend as the server, configured via `RUSTSPELL_DB_PATH` or `RUSTSPELL_DB_URL`.
+- **F71** The command must function while the server container is offline, by opening the store directly without binding the API or metrics ports, spawning background tasks, or warming dictionaries.
+- **F72** If exactly one active `platform` key with `label` `"bootstrap"` exists, the command shall rotate it and print the new raw value exactly once to stdout.
+- **F73** If no active `platform` key with `label` `"bootstrap"` exists, the command shall create one with label `"bootstrap"` and print the new raw value exactly once.
+- **F74** If more than one active `platform` key with `label` `"bootstrap"` exists, the command shall fail with a non-zero exit code and a clear error, leaving all keys untouched.
+- **F75** Rotation shall invalidate the previous raw value immediately in the store. The command must persist the new hash and update the store's key caches so the next server start sees the new key.
+- **F76** The command shall require interactive confirmation unless a `--yes` flag is provided.
+- **F77** On any failure the command shall return a non-zero exit code and write a descriptive message to stderr.
+- **F78** The command shall not start the HTTP or metrics servers.
+- **F79** Usage via `docker-compose.yml` shall require no changes to the compose file; it reuses the existing `rustspell` service image and the `data` volume (or `postgres-data` when the `postgres` profile is used). Example invocation: `docker compose run --rm rustspell reset-platform-key`.
+- **F80** When `RUSTSPELL_BOOTSTRAP_SECRETS_PATH` is set, the command shall also write the new raw key to that path in the same JSON shape as the startup bootstrap writer.
+- **F81** The command shall support a `--json` flag that outputs only `{"platform_key":"..."}` (no human-readable wrapper text) and a `--quiet` flag that outputs only the raw key value. These flags are mutually exclusive with each other and with the default human-readable format.
+
 ## 4. Non-Functional Requirements
 
 | ID | Requirement | Target |
@@ -190,6 +208,7 @@ The billing app's usage dashboard needs latency, error, and language history. No
 - **US23** As a browser-based consumer, I want to discover available languages without an API key so that the UI can list supported dictionaries before I authenticate.
 - **US24** As a platform operator, I want to register a new dictionary source URL and have the server download/cache it immediately so that tenants can use the language without a redeploy.
 - **US25** As a platform operator, I want startup to fail if a registered dictionary source is broken so that runtime spell-check requests don't hit a half-loaded state.
+- **US26** As an operator who has lost or leaked the bootstrap platform key, I want to run a containerized CLI command against my existing Docker Compose deployment to get a new bootstrap key, so I can regain platform access without redeploying or manually editing the database.
 
 ## 6. Decisions
 
@@ -237,7 +256,11 @@ The billing app's usage dashboard needs latency, error, and language history. No
 
 ## 7. Remaining Open Questions
 
-No major product questions remain, including for API key authentication (§3.7–3.8), SaaS multi-tenancy (§3.9), and usage metrics (§3.10). One deferred design detail: the exact shape of the per-tenant CORS-origin management endpoints (F41) — CRUD-equivalent to `/api-keys`, but not spec'd field-by-field here; resolve in `/sc:design`. The next step is architecture/design.
+No major product questions remain, including for API key authentication (§3.7–3.8), SaaS multi-tenancy (§3.9), and usage metrics (§3.10). Two deferred design details:
+- The exact shape of the per-tenant CORS-origin management endpoints (F41) — CRUD-equivalent to `/api-keys`, but not spec'd field-by-field here; resolve in `/sc:design`.
+- The bootstrap key reset CLI in §3.12: exact command name, output modes, and whether to mirror the capability as a platform-only HTTP endpoint; resolve in `/sc:design`.
+
+The next step is architecture/design.
 
 **External dependency (out of scope here):** the `spellcheckapi.com` PHP app must inject a platform- or admin-authenticated HTTP client into `RustMetricsService` and add the four routes to its `e2e/mock-api-server.js`. The endpoints are inert until it does. Tracked in that repository, not this one.
 

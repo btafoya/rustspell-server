@@ -1,6 +1,7 @@
 //! Rust Spell Server library.
 
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod dictionary;
 pub mod engine;

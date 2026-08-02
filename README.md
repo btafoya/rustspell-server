@@ -178,6 +178,24 @@ The file is only written when a new platform key is bootstrapped, and contains:
 { "platform_key": "rsk_..." }
 ```
 
+### Resetting the Bootstrap Key
+
+If the bootstrap platform key is lost or compromised, run the offline
+`reset-platform-key` subcommand against the same store. With Docker Compose,
+stop the server container first, then:
+
+```bash
+docker compose run --rm rustspell reset-platform-key --yes
+```
+
+This rotates the existing `bootstrap` platform key in place (same id/label,
+new raw value) and prints the new key once. Add `--json` for machine-readable
+output (`{"platform_key":"..."}`) or `--quiet` for just the raw value. If
+`RUSTSPELL_BOOTSTRAP_SECRETS_PATH` is set, the new key is also written there.
+
+The command does not start the HTTP server or warm dictionaries; it opens the
+store directly and exits.
+
 ## Live API Testing
 
 A live-call test suite validates every operation in `openapi.json` against a

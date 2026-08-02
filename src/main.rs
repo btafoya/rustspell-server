@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use rustspell_server::{
-    auth, config,
+    auth, cli, config,
     dictionary::DictionaryManager,
     engine::{Engine, EngineRegistry},
     handlers::{self, AppState},
@@ -17,6 +17,12 @@ use rustspell_server::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Dispatch offline CLI subcommands before starting the server runtime.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("reset-platform-key") {
+        return cli::run(&args[2..]).await;
+    }
+
     // Initialize tracing subscriber
     let config = config::load()?;
     tracing_subscriber::fmt()
@@ -60,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("bootstrap platform API key created");
 
         if let Ok(path) = std::env::var("RUSTSPELL_BOOTSTRAP_SECRETS_PATH") {
-            if let Err(e) = write_bootstrap_secrets(&path, &created.raw_key) {
+            if let Err(e) = cli::write_bootstrap_secrets(&path, &created.raw_key) {
                 tracing::warn!("failed to write bootstrap secrets file at {path}: {e}");
             }
         }
@@ -185,14 +191,4 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("SIGINT received, starting graceful shutdown"),
         _ = term => tracing::info!("SIGTERM received, starting graceful shutdown"),
     }
-}
-
-/// Write the freshly bootstrapped platform key to a JSON file so external
-/// tooling (e.g., the live API test suite) can authenticate without scraping
-/// stdout. The file is only written when a new bootstrap key is created.
-fn write_bootstrap_secrets(path: &str, platform_key: &str) -> anyhow::Result<()> {
-    let secrets = serde_json::json!({ "platform_key": platform_key });
-    let contents = serde_json::to_string_pretty(&secrets)?;
-    std::fs::write(path, contents)?;
-    Ok(())
 }
